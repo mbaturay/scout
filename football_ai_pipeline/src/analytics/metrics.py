@@ -168,11 +168,33 @@ class MetricsComputer:
         player_stats = self._compute_player_stats(events, per_frame_players, fps)
         coverage = self._compute_coverage(ownership, per_frame_ball)
 
+        # Log derived timing parameters
+        n_frames = len(per_frame_players)
+        dt = 1.0 / fps if fps > 0 else 0.0
+        n_pitch = sum(
+            1 for fp in per_frame_players
+            for p in fp.values() if p.get("is_pitch", False)
+        )
+        n_pixel = sum(
+            1 for fp in per_frame_players
+            for p in fp.values() if not p.get("is_pitch", False)
+        )
+        logger.info(
+            "Stats diagnostics: %d frames, dt=%.4fs (%.1f fps), "
+            "player entries: %d pitch-coords, %d pixel-coords",
+            n_frames, dt, fps, n_pitch, n_pixel,
+        )
+
+        # Sanity-check computed stats
+        warnings = list(coverage.get("warnings", []))
+        clip_duration_sec = n_frames * dt
+        warnings.extend(self._sanity_check_stats(player_stats, clip_duration_sec))
+
         return {
             "team_stats": team_stats,
             "player_stats": player_stats,
             "coverage": coverage,
-            "warnings": coverage.get("warnings", []),
+            "warnings": warnings,
         }
 
     # ---- Team stats ----
@@ -302,15 +324,22 @@ class MetricsComputer:
 
     # ---- Player stats ----
 
+    # Max single-frame displacement to accept (metres). Larger = tracking glitch.
+    _MAX_FRAME_DISPLACEMENT_M = 5.0
+    _SPEED_CAP_MPS = 15.0
+
     def _compute_player_stats(
         self,
         events: list[MatchEvent],
         per_frame_players: list[dict[int, dict[str, Any]]],
         fps: float,
     ) -> dict[int, dict[str, Any]]:
+        dt = 1.0 / fps if fps > 0 else 0.0
+
         # Accumulate per-player data
         player_team: dict[int, int] = {}
         player_distances: dict[int, float] = defaultdict(float)
+        player_active_frames: dict[int, int] = defaultdict(int)
         player_speeds: dict[int, list[float]] = defaultdict(list)
         player_positions: dict[int, list[tuple[float, float]]] = defaultdict(list)
         prev_pos: dict[int, tuple[float, float]] = {}
@@ -324,13 +353,19 @@ class MetricsComputer:
                 if pinfo.get("is_pitch", False):
                     pos = (pinfo["x"], pinfo["y"])
                     player_positions[pid].append(pos)
-                    speed = pinfo.get("speed_mps")
-                    if speed is not None:
-                        player_speeds[pid].append(speed)
+                    player_active_frames[pid] += 1
+
                     if pid in prev_pos:
                         dx = pos[0] - prev_pos[pid][0]
                         dy = pos[1] - prev_pos[pid][1]
-                        player_distances[pid] += math.sqrt(dx * dx + dy * dy)
+                        seg_dist = math.sqrt(dx * dx + dy * dy)
+                        if seg_dist <= self._MAX_FRAME_DISPLACEMENT_M:
+                            player_distances[pid] += seg_dist
+                            if dt > 0:
+                                player_speeds[pid].append(
+                                    min(seg_dist / dt, self._SPEED_CAP_MPS)
+                                )
+                        # else: tracking glitch, skip segment
                     prev_pos[pid] = pos
 
         # Event counts per player
@@ -344,6 +379,8 @@ class MetricsComputer:
             speeds = player_speeds.get(pid, [])
             positions = player_positions.get(pid, [])
             is_pitch = len(positions) > 0
+            dist = player_distances.get(pid, 0.0)
+            active_sec = player_active_frames.get(pid, 0) * dt
 
             heatmap = None
             if positions:
@@ -355,8 +392,8 @@ class MetricsComputer:
             evts = player_events.get(pid, {})
             result[pid] = {
                 "team_id": player_team.get(pid),
-                "distance_covered_m": round(player_distances.get(pid, 0.0), 1),
-                "avg_speed_mps": round(float(np.mean(speeds)), 2) if speeds else 0.0,
+                "distance_covered_m": round(dist, 1),
+                "avg_speed_mps": round(dist / active_sec, 2) if active_sec > 0 else 0.0,
                 "top_speed_mps": round(max(speeds), 2) if speeds else 0.0,
                 "confidence": "pitch" if is_pitch else "pixel",
                 "touches": evts.get("touch", 0),
@@ -405,6 +442,54 @@ class MetricsComputer:
             "high_confidence_pct": round(high_conf / max(1, total) * 100, 1),
             "warnings": warnings,
         }
+
+    # ---- Sanity checks ----
+
+    @staticmethod
+    def _sanity_check_stats(
+        player_stats: dict[int, dict[str, Any]],
+        clip_duration_sec: float,
+    ) -> list[str]:
+        """Flag obviously incorrect units in computed stats.
+
+        Returns a list of human-readable warning strings.
+        """
+        warnings: list[str] = []
+
+        for pid, ps in player_stats.items():
+            top_speed = ps.get("top_speed_mps", 0.0)
+            avg_speed = ps.get("avg_speed_mps", 0.0)
+            distance = ps.get("distance_covered_m", 0.0)
+            coord_type = ps.get("confidence", "unknown")
+
+            if top_speed > 20.0:
+                msg = (
+                    f"Player {pid}: top_speed_mps={top_speed:.1f} exceeds 20 m/s. "
+                    f"Check homography scale / time delta. "
+                    f"(coords={coord_type})"
+                )
+                warnings.append(msg)
+                logger.warning(msg)
+
+            if avg_speed > 12.0:
+                msg = (
+                    f"Player {pid}: avg_speed_mps={avg_speed:.1f} exceeds 12 m/s. "
+                    f"Check homography scale / time delta. "
+                    f"(coords={coord_type})"
+                )
+                warnings.append(msg)
+                logger.warning(msg)
+
+            if clip_duration_sec > 0 and clip_duration_sec < 120 and distance > 2000:
+                msg = (
+                    f"Player {pid}: distance_covered_m={distance:.0f} in "
+                    f"{clip_duration_sec:.0f}s clip is unrealistic (>{2000}m in <2min). "
+                    f"Check homography scale. (coords={coord_type})"
+                )
+                warnings.append(msg)
+                logger.warning(msg)
+
+        return warnings
 
     # ---- Export helpers ----
 

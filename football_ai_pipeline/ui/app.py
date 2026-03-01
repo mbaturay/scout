@@ -73,6 +73,9 @@ _ARTIFACT_CONTRACT: dict[str, list[str]] = {
     ],
     "events": ["events.json"],
     "run_report": ["run_report.json", "metadata.json"],
+    "team_possession": ["team_possession.json"],
+    "pass_events": ["pass_events.json"],
+    "player_touches": ["player_touches.csv"],
 }
 
 
@@ -306,9 +309,12 @@ def _normalize_player_df(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     for col in ("touches", "receptions", "passes", "interceptions", "tackles",
-                "shots", "sprint_count"):
+                "shots", "sprint_count", "passes_attempted", "passes_completed"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    for col in ("pass_accuracy_pct",):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
     return df
 
 
@@ -354,6 +360,9 @@ def _load_output_artifacts(output_dir: Path) -> dict[str, Any]:
         "rolling_summary": None,
         "metadata": None,
         "run_report": None,
+        "team_possession": None,
+        "pass_events": None,
+        "player_touches_df": None,
         "loaded": [],
         "missing": [],
     }
@@ -447,6 +456,40 @@ def _load_output_artifacts(output_dir: Path) -> dict[str, Any]:
                 result["loaded"].append(rel)
             break
 
+    # -- Team possession (team_possession.json) --
+    tp_path = output_dir / "team_possession.json"
+    tp_data = _read_json(tp_path)
+    if tp_data is not None:
+        result["team_possession"] = tp_data
+        result["loaded"].append("team_possession.json")
+
+    # -- Pass events (pass_events.json) --
+    pe_path = output_dir / "pass_events.json"
+    pe_data = _read_json(pe_path)
+    if pe_data is not None:
+        result["pass_events"] = pe_data
+        result["loaded"].append("pass_events.json")
+
+    # -- Player touches (player_touches.csv) --
+    pt_path = output_dir / "player_touches.csv"
+    pt_df = _load_df_from_csv(pt_path)
+    if pt_df is not None:
+        result["player_touches_df"] = pt_df
+        result["loaded"].append("player_touches.csv")
+
+    # -- Merge touches into player_df if player_df lacks touches --
+    if result["player_df"] is not None and result["player_touches_df"] is not None:
+        pdf = result["player_df"]
+        tdf = result["player_touches_df"]
+        has_touches = "touches" in pdf.columns and pdf["touches"].sum() > 0
+        if not has_touches and "touches" in tdf.columns and "track_id" in tdf.columns:
+            pdf = pdf.drop(columns=["touches"], errors="ignore")
+            tdf_merge = tdf[["track_id", "touches"]].copy()
+            tdf_merge["track_id"] = pd.to_numeric(tdf_merge["track_id"], errors="coerce").fillna(0).astype(int)
+            tdf_merge["touches"] = pd.to_numeric(tdf_merge["touches"], errors="coerce").fillna(0).astype(int)
+            result["player_df"] = pdf.merge(tdf_merge, on="track_id", how="left")
+            result["player_df"]["touches"] = result["player_df"]["touches"].fillna(0).astype(int)
+
     return result
 
 
@@ -465,6 +508,8 @@ def _load_match_stats(output_dir: Path) -> dict[str, Any]:
         "player_summary": artifacts["player_summary"],
         "rolling_summary": artifacts["rolling_summary"],
         "metadata": artifacts["metadata"],
+        "team_possession": artifacts["team_possession"],
+        "pass_events": artifacts["pass_events"],
         "loaded": artifacts["loaded"],
         "missing": artifacts["missing"],
         "mtimes": {},   # not needed anymore but kept for compat
@@ -481,6 +526,9 @@ _PLAYER_COL_RENAME: dict[str, str] = {
     "touches": "Touches",
     "receptions": "Receptions",
     "passes": "Passes",
+    "passes_attempted": "Pass Att",
+    "passes_completed": "Pass Comp",
+    "pass_accuracy_pct": "Pass %",
     "interceptions": "Interceptions",
     "tackles": "Tackles",
     "shots": "Shots",
@@ -506,6 +554,8 @@ def _render_match_analytics(
     missing = stats.get("missing", [])
     loaded = stats.get("loaded", [])
     team_summary = stats.get("team_summary")  # nested per-module dict from stats/team_summary.json
+    team_possession = stats.get("team_possession")  # from team_possession.json
+    pass_events_data = stats.get("pass_events")  # from pass_events.json
 
     has_data = team_df is not None or player_df is not None or events
 
@@ -532,18 +582,30 @@ def _render_match_analytics(
         st.markdown("#### Team Overview")
         n_teams = len(team_df)
         team_cols = st.columns(max(n_teams, 1))
+
+        # Build a possession lookup from team_possession.json as fallback
+        _tp_lookup: dict[int, float] = {}
+        if team_possession and isinstance(team_possession, dict):
+            for t in team_possession.get("teams", []):
+                if isinstance(t, dict) and "team_id" in t:
+                    _tp_lookup[t["team_id"]] = t.get("possession_pct", 0.0)
+
         for i, (_, row) in enumerate(team_df.iterrows()):
             with team_cols[i % len(team_cols)]:
                 tid = row.get("team_id", i)
                 st.markdown(f"**Team {tid}**")
-                if "possession_pct" in row:
+                # Possession: prefer team_stats column, fallback to team_possession.json
+                if "possession_pct" in row and pd.notna(row["possession_pct"]) and row["possession_pct"] > 0:
                     st.metric("Possession", f"{row['possession_pct']:.1f}%")
+                elif tid in _tp_lookup:
+                    st.metric("Possession", f"{_tp_lookup[tid]:.1f}%")
                 if "xG_total" in row:
                     st.metric("xG", f"{row['xG_total']:.2f}")
                 if "pass_count" in row:
-                    st.metric("Passes", int(row["pass_count"]))
-                if "pass_completed" in row and "pass_completion_pct" in row:
-                    st.metric("Pass Accuracy", f"{row['pass_completion_pct']:.0f}%")
+                    acc_str = ""
+                    if "pass_completion_pct" in row and pd.notna(row["pass_completion_pct"]):
+                        acc_str = f" ({row['pass_completion_pct']:.0f}% acc)"
+                    st.metric("Passes", f"{int(row['pass_count'])}{acc_str}")
                 if "shots_count" in row:
                     st.metric("Shots", int(row["shots_count"]))
                 if "interceptions" in row:
@@ -556,6 +618,32 @@ def _render_match_analytics(
                     st.metric("Press Intensity", f"{row['press_intensity']:.2f}")
                 if "territory_avg_x" in row:
                     st.metric("Territory Avg X", f"{row['territory_avg_x']:.1f}m")
+
+        # -- Ball coverage line --
+        run_report = stats.get("run_report")
+        if run_report:
+            cov = run_report.get("coverage", {})
+            analytics = cov.get("analytics", {})
+            total_frames = cov.get("total_frames_processed", 0)
+            ball_det_pct = cov.get("ball_position_available_pct", 0)
+            ball_own_pct = analytics.get("ball_owner_pct", 0)
+            if total_frames > 0:
+                st.caption(
+                    f"Ball coverage: detected {ball_det_pct:.0f}% of frames, "
+                    f"owner assigned {ball_own_pct:.0f}% of frames"
+                )
+        elif team_possession and isinstance(team_possession, dict):
+            tp_total = team_possession.get("total_frames", 0)
+            tp_owned = team_possession.get("owned_frames", 0)
+            tp_missing = team_possession.get("ball_missing_frames", 0)
+            if tp_total > 0:
+                det_frames = tp_total - tp_missing
+                st.caption(
+                    f"Ball coverage: detected {det_frames}/{tp_total} frames "
+                    f"({det_frames / tp_total * 100:.0f}%), "
+                    f"owned {tp_owned}/{det_frames} detected "
+                    f"({tp_owned / max(det_frames, 1) * 100:.0f}%)"
+                )
 
         # Enrichment from team_summary (physical stats from stats/team_summary.json)
         if team_summary and isinstance(team_summary, dict):
@@ -582,6 +670,16 @@ def _render_match_analytics(
         counts: dict[str, int] = {}
         for e in events:
             counts[e.get("event_type", "unknown")] = counts.get(e.get("event_type", "unknown"), 0) + 1
+        # Supplement from pass_events.json if main events lack pass/interception
+        if pass_events_data and isinstance(pass_events_data, dict):
+            pe_list = pass_events_data.get("pass_events", [])
+            if pe_list and "pass" not in counts and "interception" not in counts:
+                for pe in pe_list:
+                    if pe.get("is_completed"):
+                        counts["pass"] = counts.get("pass", 0) + 1
+                    else:
+                        reason = pe.get("reason", "turnover")
+                        counts[reason] = counts.get(reason, 0) + 1
         evt_cols = st.columns(min(len(counts), 6)) if counts else [st]
         for i, (etype, cnt) in enumerate(sorted(counts.items())):
             evt_cols[i % len(evt_cols)].metric(etype.replace("_", " ").title(), cnt)
@@ -701,6 +799,7 @@ st.markdown("""
 .console-badge-running { background: #2a4d2a; color: #7ec87e; }
 .console-badge-done { background: #1a3a5c; color: #61afef; }
 .console-badge-error { background: #5c1a1a; color: #e06c75; }
+.console-badge-canceled { background: #5c4a1a; color: #e5c07b; }
 
 .terminal-panel {
     background-color: #1e1e1e;
@@ -867,7 +966,7 @@ with st.sidebar:
     st.divider()
 
     # -- Action buttons --
-    if st.session_state.run_state in ("done", "error"):
+    if st.session_state.run_state in ("done", "error", "canceled"):
         if st.button("Run again", type="primary", use_container_width=True):
             _reset_state()
             st.rerun()
@@ -881,9 +980,26 @@ with st.sidebar:
                 except subprocess.TimeoutExpired:
                     proc.kill()
             st.session_state.log_lines.append("--- Pipeline stopped by user ---")
-            st.session_state.run_state = "error"
+            st.session_state.run_state = "canceled"
             st.session_state.last_error = "Stopped by user"
             st.session_state.run_finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Write a cancellation run_report so partial artifacts are not treated as corrupted
+            out_dir = st.session_state.get("output_dir", "")
+            if out_dir:
+                _out = Path(out_dir)
+                _out.mkdir(parents=True, exist_ok=True)
+                _cancel_report = {
+                    "status": "canceled",
+                    "error_type": "user_cancel",
+                    "message": "Stopped by user",
+                    "started_at": st.session_state.run_started_at,
+                    "stopped_at": st.session_state.run_finished_at,
+                }
+                try:
+                    with open(_out / "run_report.json", "w") as _f:
+                        json.dump(_cancel_report, _f, indent=2)
+                except OSError:
+                    pass
             st.rerun()
     else:
         # idle
@@ -1372,6 +1488,25 @@ elif run_state == "done":
     # -- Docked console at bottom --
     st.markdown(
         _render_console_html(st.session_state.log_lines, status="done"),
+        unsafe_allow_html=True,
+    )
+
+# ---- CANCELED ----
+elif run_state == "canceled":
+    st.warning(
+        f"Pipeline canceled\n\n"
+        f"**Reason:** {st.session_state.last_error}  \n"
+        f"**Started:** {st.session_state.run_started_at}  \n"
+        f"**Stopped:** {st.session_state.run_finished_at}  \n\n"
+        f"Partial artifacts (if any) are preserved in the output directory."
+    )
+
+    # Bottom padding so sticky console doesn't obscure content
+    st.markdown('<div style="padding-bottom: 320px;"></div>', unsafe_allow_html=True)
+
+    # Docked console
+    st.markdown(
+        _render_console_html(st.session_state.log_lines, status="canceled"),
         unsafe_allow_html=True,
     )
 

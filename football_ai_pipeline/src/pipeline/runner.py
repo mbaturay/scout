@@ -318,6 +318,9 @@ class PipelineRunner:
         elapsed = time.time() - start_time
         logger.info("Processing complete in %.1f seconds", elapsed)
 
+        # Log motion physics diagnostics
+        self.pitch_transformer.log_diagnostics()
+
         # Get aggregated stats
         full_report = self.stats_aggregator.get_full_report()
 
