@@ -135,6 +135,7 @@ def _run_pipeline_subprocess(
     progress: dict[str, int],
     proc_holder: dict[str, Any],
     ui_queue: queue.Queue | None = None,
+    device: str = "auto",
 ) -> int:
     """Run the pipeline CLI as a subprocess, streaming stdout into *log_lines*.
 
@@ -148,6 +149,7 @@ def _run_pipeline_subprocess(
         "--config", config_path,
         "--stride", str(stride),
         "--save-video", str(save_video).lower(),
+        "--device", device,
     ]
     if max_frames is not None and max_frames > 0:
         cmd += ["--max-frames", str(max_frames)]
@@ -1086,6 +1088,19 @@ st.markdown("""
 st.title("Football AI Pipeline")
 st.caption("Local-first football analytics — from broadcast video to advanced stats")
 
+# -- Compute device badge --
+def _compute_badge() -> str:
+    """Return a human-readable compute label for the header badge."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return f"{torch.cuda.get_device_name(0)} (CUDA)"
+    except Exception:
+        pass
+    return "CPU"
+
+st.markdown(f"**Compute:** {_compute_badge()}")
+
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -1182,6 +1197,15 @@ with st.sidebar:
         "Save annotated video",
         value=_qs_savevideo if _qs_savevideo is not None else True,
         key="cfg_save_video",
+    )
+
+    device_options = ["Auto", "CUDA (GPU)", "CPU"]
+    device_choice: str = st.selectbox(
+        "Compute device",
+        device_options,
+        index=0,
+        key="cfg_device",
+        help="Auto picks CUDA when available, else CPU.",
     )
 
     st.divider()
@@ -1363,6 +1387,7 @@ if st.session_state.run_state == "idle" and _run_requested:
     _t_mf = max_frames
     _t_sv = save_video
     _t_q = st.session_state["ui_queue"]
+    _t_dev = {"Auto": "auto", "CUDA (GPU)": "cuda", "CPU": "cpu"}.get(device_choice, "auto")
 
     def _worker() -> None:
         rc = _run_pipeline_subprocess(
@@ -1376,6 +1401,7 @@ if st.session_state.run_state == "idle" and _run_requested:
             progress=_t_prog,
             proc_holder=_t_ph,
             ui_queue=_t_q,
+            device=_t_dev,
         )
         # Signal completion via the shared dict — NO st.session_state here.
         _t_ph["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

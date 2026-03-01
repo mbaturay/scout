@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from ..data_models import BBox, Detection, ObjectClass, FrameState
+from ..utils.tensors import to_cpu_numpy
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,41 @@ def _log_degradation(
     logger.warning(msg)
 
 
+def resolve_device(choice: str = "auto") -> str:
+    """Resolve a device selection string to a torch device name.
+
+    Returns ``"cuda:0"`` or ``"cpu"``.  Never imports torch if *choice*
+    is ``"cpu"``; on failure silently falls back to CPU.
+    """
+    if choice in ("cpu",):
+        return "cpu"
+    try:
+        import torch
+        has_cuda = torch.cuda.is_available()
+    except ImportError:
+        has_cuda = False
+
+    if choice == "auto":
+        return "cuda:0" if has_cuda else "cpu"
+    # Explicit cuda request
+    if has_cuda:
+        return "cuda:0"
+    logger.warning("CUDA requested but not available — falling back to CPU")
+    return "cpu"
+
+
+def get_device_label() -> str:
+    """Return a human-readable compute badge, e.g. ``'RTX 3070 (CUDA)'``."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            return f"{name} (CUDA)"
+    except Exception:
+        pass
+    return "CPU"
+
+
 class ObjectDetector:
     """Detect objects in frames using YOLO or fallback."""
 
@@ -191,8 +227,11 @@ class ObjectDetector:
         det_cfg = config.get("detection", {})
         self.confidence_threshold: float = det_cfg.get("confidence", 0.25)
         self.iou_threshold: float = det_cfg.get("iou_threshold", 0.45)
+        self._device: str = resolve_device(det_cfg.get("device", "auto"))
         self._model, self.status = _try_load_yolo(config)
         self._class_map = self._pick_class_map()
+        if self._model is not None:
+            self._move_model_to_device()
 
     def _pick_class_map(self) -> dict[int, ObjectClass]:
         """Select class map: football-specific if model has <=10 classes, COCO otherwise."""
@@ -206,6 +245,14 @@ class ObjectDetector:
         # Generic COCO model — map person->PLAYER, sports ball->BALL
         logger.info("Using COCO class map (model has %d classes: person->PLAYER, sports ball->BALL)", len(names))
         return _COCO_CLASS_MAP
+
+    def _move_model_to_device(self) -> None:
+        """Move YOLO model to the resolved device (GPU or CPU)."""
+        try:
+            self._model.to(self._device)
+            logger.info("Detection model moved to %s", self._device)
+        except Exception as e:
+            logger.warning("Could not move model to %s: %s — using default", self._device, e)
 
     @property
     def is_available(self) -> bool:
@@ -225,6 +272,7 @@ class ObjectDetector:
             frame_state.image,
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
+            device=self._device,
             verbose=False,
         )
         detections: list[Detection] = []
@@ -232,20 +280,24 @@ class ObjectDetector:
             boxes = r.boxes
             if boxes is None:
                 continue
-            for i in range(len(boxes)):
-                xyxy = boxes.xyxy[i].cpu().numpy()
-                conf = float(boxes.conf[i].cpu().numpy())
-                cls_id = int(boxes.cls[i].cpu().numpy())
+            # Bulk-convert entire tensors to CPU numpy once (not per-row)
+            all_xyxy = to_cpu_numpy(boxes.xyxy)   # (N, 4)
+            all_conf = to_cpu_numpy(boxes.conf)    # (N,)
+            all_cls = to_cpu_numpy(boxes.cls)      # (N,)
+            for i in range(len(all_xyxy)):
+                cls_id = int(all_cls[i])
                 obj_class = self._class_map.get(cls_id)
                 if obj_class is None:
                     continue  # skip classes not relevant to football
                 det = Detection(
                     bbox=BBox(
-                        x1=float(xyxy[0]), y1=float(xyxy[1]),
-                        x2=float(xyxy[2]), y2=float(xyxy[3]),
+                        x1=float(all_xyxy[i][0]),
+                        y1=float(all_xyxy[i][1]),
+                        x2=float(all_xyxy[i][2]),
+                        y2=float(all_xyxy[i][3]),
                     ),
                     class_id=obj_class,
-                    confidence=conf,
+                    confidence=float(all_conf[i]),
                 )
                 detections.append(det)
         frame_state.detections = detections

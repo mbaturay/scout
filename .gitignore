@@ -1,6 +1,7 @@
 # Local/editor
 .claude/
 .venv/
+.venv-gpu/
 
 # Python cache/build artifacts
 __pycache__/

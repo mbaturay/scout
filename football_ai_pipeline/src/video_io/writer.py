@@ -9,6 +9,8 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
+from ..utils.tensors import to_cpu_numpy
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,7 @@ class VideoWriter:
         logger.info("VideoWriter: %s (%dx%d @ %.1f fps)", self.output_path, width, height, out_fps)
 
     def write(self, frame: np.ndarray) -> None:
+        frame = to_cpu_numpy(frame)
         self.writer.write(frame)
 
     def release(self) -> None:

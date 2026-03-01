@@ -85,6 +85,13 @@ examples:
         metavar="BOOL",
         help="Write annotated video (true/false, overrides config visualization.enabled)",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        metavar="DEVICE",
+        help="Compute device: auto, cuda, cuda:0, cpu (overrides config detection.device)",
+    )
     args = parser.parse_args()
 
     # Load config
@@ -122,6 +129,8 @@ examples:
         config.setdefault("video", {})["stride"] = args.stride
     if args.save_video is not None:
         config.setdefault("visualization", {})["enabled"] = args.save_video
+    if args.device is not None:
+        config.setdefault("detection", {})["device"] = args.device
 
     # Validate input
     input_path = Path(args.input)

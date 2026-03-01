@@ -13,8 +13,11 @@ import cv2
 import numpy as np
 
 from ..data_models import FrameFlag, FrameState, ObjectClass
+from ..utils.tensors import to_cpu_numpy
 
 logger = logging.getLogger(__name__)
+
+_ANNOTATE_LOG_EVERY = 50  # debug-log annotation stats every N frames
 
 TEAM_COLORS: dict[int, tuple[int, int, int]] = {
     0: (255, 100, 100),   # Blue-ish (BGR)
@@ -56,12 +59,22 @@ class FrameAnnotator:
         self._team_control_frames: dict[int, int] = {}
         self._total_owned_frames: int = 0
 
+        # Debug counter
+        self._annotate_count: int = 0
+
+    @staticmethod
+    def _safe_int(v: Any) -> int:
+        """Convert any numeric (numpy scalar, tensor, float) to Python int."""
+        return int(float(v))
+
     def annotate(self, frame_state: FrameState) -> np.ndarray | None:
         """Annotate a frame and return the annotated image."""
         if not self.enabled or frame_state.image is None:
             return frame_state.image
 
-        img = frame_state.image.copy()
+        # Force a writeable uint8 numpy copy — guarantees cv2 can draw on it
+        raw = to_cpu_numpy(frame_state.image)
+        img = np.array(raw, dtype=np.uint8, copy=True)
 
         # Update cumulative distance for each player
         self._update_distances(frame_state)
@@ -79,37 +92,46 @@ class FrameAnnotator:
         # Get current ball owner for highlight
         ball_owner_id = self._get_ball_owner(frame_state)
 
+        n_drawn = 0
         # Draw players
         for player in frame_state.players:
-            bbox = player.detection.bbox
-            team_id = player.team_id if player.team_id is not None else -1
-            color = TEAM_COLORS.get(team_id, (200, 200, 200))
-            is_owner = (ball_owner_id is not None
-                        and player.track_id == ball_owner_id)
+            try:
+                bbox = player.detection.bbox
+                x1 = self._safe_int(bbox.x1)
+                y1 = self._safe_int(bbox.y1)
+                x2 = self._safe_int(bbox.x2)
+                y2 = self._safe_int(bbox.y2)
+                team_id = player.team_id if player.team_id is not None else -1
+                color = TEAM_COLORS.get(team_id, (200, 200, 200))
+                is_owner = (ball_owner_id is not None
+                            and player.track_id == ball_owner_id)
 
-            # Owner ring — thick gold border
-            if is_owner:
-                cv2.rectangle(
-                    img,
-                    (int(bbox.x1) - 2, int(bbox.y1) - 2),
-                    (int(bbox.x2) + 2, int(bbox.y2) + 2),
-                    OWNER_RING_COLOR, 3,
+                # Owner ring — thick gold border
+                if is_owner:
+                    cv2.rectangle(
+                        img, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2),
+                        OWNER_RING_COLOR, 3,
+                    )
+
+                if self.draw_team_colors:
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+                if self.draw_ids:
+                    self._draw_player_label(img, player, color)
+
+                n_drawn += 1
+            except Exception as exc:
+                logger.warning(
+                    "Annotator: skipped player track=%s: %s",
+                    getattr(player, "track_id", "?"), exc,
                 )
-
-            if self.draw_team_colors:
-                cv2.rectangle(
-                    img,
-                    (int(bbox.x1), int(bbox.y1)),
-                    (int(bbox.x2), int(bbox.y2)),
-                    color, 2,
-                )
-
-            if self.draw_ids:
-                self._draw_player_label(img, player, color)
 
         # Draw ball with halo
         if self.draw_ball and frame_state.ball and frame_state.ball.detection:
-            self._draw_ball_halo(img, frame_state)
+            try:
+                self._draw_ball_halo(img, frame_state)
+            except Exception as exc:
+                logger.warning("Annotator: ball halo failed: %s", exc)
 
         # Optional radar overlay
         if self.radar_overlay:
@@ -132,6 +154,16 @@ class FrameAnnotator:
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
         )
 
+        self._annotate_count += 1
+        if self._annotate_count % _ANNOTATE_LOG_EVERY == 0:
+            n_players = len(frame_state.players)
+            has_ball = frame_state.ball is not None and frame_state.ball.detection is not None
+            print(
+                f"[Annotator] frame {frame_state.frame_idx} "
+                f"drawing {n_drawn}/{n_players} boxes, ball={has_ball}",
+                flush=True,
+            )
+
         return img
 
     # ------------------------------------------------------------------
@@ -142,17 +174,17 @@ class FrameAnnotator:
         self, img: np.ndarray, player: Any, color: tuple[int, int, int],
     ) -> None:
         bbox = player.detection.bbox
-        tid = player.track_id
+        tid = int(player.track_id)
 
         # Line 1: track ID + speed
         label = f"#{tid}"
         if self.show_speed and player.speed_mps is not None:
-            kmh = player.speed_mps * 3.6
+            kmh = float(player.speed_mps) * 3.6
             label += f" {kmh:.1f}km/h"
 
         # Draw label background for readability
-        x_pos = int(bbox.x1)
-        y_pos = int(bbox.y1) - 5
+        x_pos = self._safe_int(bbox.x1)
+        y_pos = self._safe_int(bbox.y1) - 5
 
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         cv2.rectangle(
@@ -189,8 +221,8 @@ class FrameAnnotator:
 
     def _draw_ball_halo(self, img: np.ndarray, frame_state: FrameState) -> None:
         bbox = frame_state.ball.detection.bbox
-        cx, cy = int(bbox.center[0]), int(bbox.center[1])
-        radius = max(5, int(bbox.width / 2))
+        cx, cy = int(float(bbox.center[0])), int(float(bbox.center[1]))
+        radius = max(5, int(float(bbox.width) / 2))
 
         # Outer halo (translucent effect via thick ring)
         cv2.circle(img, (cx, cy), radius + 8, HALO_COLOR, 2, cv2.LINE_AA)
