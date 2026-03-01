@@ -13,6 +13,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -133,8 +134,13 @@ def _run_pipeline_subprocess(
     log_lines: list[str],
     progress: dict[str, int],
     proc_holder: dict[str, Any],
+    ui_queue: queue.Queue | None = None,
 ) -> int:
-    """Run the pipeline CLI as a subprocess, streaming stdout into *log_lines*."""
+    """Run the pipeline CLI as a subprocess, streaming stdout into *log_lines*.
+
+    If *ui_queue* is provided, structured events are pushed periodically so the
+    UI can render live metrics without polling shared dicts directly.
+    """
     cmd = [
         sys.executable, "-m", "football_ai_pipeline",
         "--input", video_path,
@@ -157,6 +163,17 @@ def _run_pipeline_subprocess(
     )
     proc_holder["proc"] = proc
 
+    # Throttle queue pushes: only emit a progress event every N frames
+    _last_pushed_frame = 0
+    _PUSH_EVERY = 10
+
+    # Accumulators for live_stats parsed from log lines
+    _players_tracked = 0
+    _ball_detected = False
+    _passes_detected = 0
+    _events_so_far: dict[str, int] = {}
+    _start_ts = time.time()
+
     assert proc.stdout is not None
     for line in iter(proc.stdout.readline, ""):
         line = line.rstrip("\n")
@@ -176,6 +193,20 @@ def _run_pipeline_subprocess(
                 progress["frames_done"] = done
                 progress["frames_total"] = total
                 progress["pct"] = min(int(done / total * 100), 100)
+
+                # Push progress event every _PUSH_EVERY frames
+                if ui_queue is not None and (done - _last_pushed_frame) >= _PUSH_EVERY:
+                    _last_pushed_frame = done
+                    elapsed = time.time() - _start_ts
+                    fps_est = done / max(elapsed, 0.1)
+                    eta = (total - done) / max(fps_est, 0.01)
+                    ui_queue.put({
+                        "type": "progress",
+                        "frame_idx": done,
+                        "total_frames": total,
+                        "fps": round(fps_est, 1),
+                        "eta_s": round(eta, 0),
+                    })
 
         # Detect pipeline stages from log messages
         line_lower = line.lower()
@@ -198,11 +229,57 @@ def _run_pipeline_subprocess(
         if "[ERROR]" in line or "ERROR:" in line:
             progress["error_count"] = progress.get("error_count", 0) + 1
 
+        # --- Parse structured [LIVE_STATS] lines from runner ---
+        if line.startswith("[LIVE_STATS] "):
+            try:
+                ls = json.loads(line[len("[LIVE_STATS] "):])
+                _players_tracked = ls.get("players_tracked_current", _players_tracked)
+                _ball_detected = ls.get("ball_detected_pct", 0) > 0
+                _passes_detected = ls.get("passes_so_far", _passes_detected)
+                if ui_queue is not None:
+                    ui_queue.put({
+                        "type": "live_stats",
+                        "frames_seen": ls.get("frames_seen", 0),
+                        "ball_detected_pct": ls.get("ball_detected_pct", 0.0),
+                        "players_tracked": _players_tracked,
+                        "possession_by_team": ls.get("possession_by_team", {}),
+                        "passes_so_far": _passes_detected,
+                        "stage": ls.get("stage", ""),
+                    })
+            except (json.JSONDecodeError, TypeError):
+                pass  # malformed line — skip silently
+
+        # Fallback: detect passes/events from finalize-phase log lines
+        m_pass = re.search(r"detected\s+(\d+)\s+pass\s+events?", line_lower)
+        if m_pass:
+            _passes_detected = int(m_pass.group(1))
+        m_ev = re.search(r"detected\s+(\d+)\s+events?", line_lower)
+        if m_ev and "pass" not in line_lower:
+            _events_so_far["total"] = int(m_ev.group(1))
+        if ui_queue is not None and (m_pass or m_ev):
+            ui_queue.put({
+                "type": "live_stats",
+                "frames_seen": 0,
+                "ball_detected_pct": 0.0,
+                "players_tracked": _players_tracked,
+                "possession_by_team": {},
+                "passes_so_far": _passes_detected,
+                "stage": "Finalizing",
+            })
+
     proc.wait()
     proc_holder["proc"] = None
     progress["pct"] = 100 if proc.returncode == 0 else progress.get("pct", 0)
     if proc.returncode == 0:
         progress["current_stage"] = "Complete"
+
+    # Push terminal event so the UI can transition immediately
+    if ui_queue is not None:
+        if proc.returncode == 0:
+            ui_queue.put({"type": "done"})
+        else:
+            ui_queue.put({"type": "failed", "return_code": proc.returncode})
+
     return proc.returncode
 
 
@@ -267,6 +344,22 @@ def _render_console_html(
         '<script>var e=document.getElementById("term-log");'
         'if(e)e.scrollTop=e.scrollHeight;</script>'
     )
+
+
+def _render_developer_console(lines: list[str], status: str = "running") -> None:
+    """Render log output inside a collapsed expander."""
+    n = len(lines)
+    label = f"Developer Console ({n} lines)"
+    if status == "error":
+        label += " — ERRORS"
+    with st.expander(label, expanded=False):
+        if not lines:
+            st.caption("Waiting for output...")
+        else:
+            st.markdown(
+                _render_console_html(lines, status=status),
+                unsafe_allow_html=True,
+            )
 
 
 def _read_json(path: Path) -> Any:
@@ -894,7 +987,7 @@ def _render_match_analytics(
 # ---------------------------------------------------------------------------
 
 _STATE_DEFAULTS: dict[str, Any] = {
-    "run_state": "idle",        # idle | running | done | error
+    "run_state": "idle",        # idle | running | done | canceled | error
     "run_started_at": "",
     "run_finished_at": "",
     "run_start_ts": 0.0,        # time.time() for elapsed calculation
@@ -907,6 +1000,18 @@ _STATE_DEFAULTS: dict[str, Any] = {
         "warn_count": 0,
         "error_count": 0,
         "last_line": "",
+    },
+    "live_metrics": {            # snapshot updated by draining ui_queue
+        "frame_idx": 0,
+        "total_frames": 0,
+        "fps": 0.0,
+        "eta_s": 0.0,
+        "frames_seen": 0,
+        "ball_detected_pct": 0.0,
+        "players_tracked": 0,
+        "possession_by_team": {},   # {"0": 52.3, "1": 47.7}
+        "passes_so_far": 0,
+        "stage": "",
     },
     "output_dir": "",
     "input_video": "",
@@ -921,6 +1026,10 @@ for _k, _v in _STATE_DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
+# Queue must be instantiated as a real object, not a dict placeholder
+if "ui_queue" not in st.session_state:
+    st.session_state["ui_queue"] = queue.Queue()
+
 
 def _reset_state() -> None:
     """Reset all run-related session state to defaults."""
@@ -934,8 +1043,12 @@ def _reset_state() -> None:
             st.session_state[k] = type(v)()
             if k == "progress":
                 st.session_state[k] = {"pct": 0}
+            elif k == "live_metrics":
+                st.session_state[k] = dict(_STATE_DEFAULTS["live_metrics"])
         else:
             st.session_state[k] = v
+    # Replace queue (old one may have stale events)
+    st.session_state["ui_queue"] = queue.Queue()
 
 
 # ---------------------------------------------------------------------------
@@ -944,48 +1057,10 @@ def _reset_state() -> None:
 
 st.set_page_config(page_title="Football AI Pipeline", layout="wide")
 
-# -- Docked console CSS + match analytics styling --
+# -- Minimal styling --
 st.markdown("""
 <style>
-/* Docked bottom console — sticky at viewport bottom */
-.console-dock {
-    position: sticky;
-    bottom: 0;
-    z-index: 100;
-    background-color: #1e1e1e;
-    border-top: 2px solid #444;
-    border-radius: 8px 8px 0 0;
-    margin-top: 24px;
-}
-.console-dock .console-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 16px;
-    background-color: #2d2d2d;
-    border-radius: 8px 8px 0 0;
-    border-bottom: 1px solid #444;
-}
-.console-dock .console-header span {
-    color: #aaa;
-    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-.console-dock .console-header .console-badge {
-    display: inline-block;
-    padding: 1px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: 700;
-}
-.console-badge-running { background: #2a4d2a; color: #7ec87e; }
-.console-badge-done { background: #1a3a5c; color: #61afef; }
-.console-badge-error { background: #5c1a1a; color: #e06c75; }
-.console-badge-canceled { background: #5c4a1a; color: #e5c07b; }
-
+/* Terminal panel inside developer console expander */
 .terminal-panel {
     background-color: #1e1e1e;
     color: #cccccc;
@@ -993,9 +1068,9 @@ st.markdown("""
     font-size: 12px;
     line-height: 1.4;
     padding: 12px 16px;
-    min-height: 180px;
-    max-height: 70vh;
-    height: 33vh;
+    min-height: 120px;
+    max-height: 50vh;
+    height: 25vh;
     resize: vertical;
     overflow-y: auto;
     white-space: pre-wrap;
@@ -1005,9 +1080,6 @@ st.markdown("""
 .terminal-panel .log-error { color: #e06c75; }
 .terminal-panel .log-info { color: #61afef; }
 .terminal-panel .log-dim { color: #666; }
-
-/* Ensure content above console has breathing room */
-.main-content-area { padding-bottom: 16px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1185,6 +1257,9 @@ with st.sidebar:
                         json.dump(_cancel_report, _f, indent=2)
                 except OSError:
                     pass
+                # Cache partial artifacts so canceled view can display them
+                st.session_state.outputs = _discover_outputs(_out)
+                st.session_state["stats_cache"] = _load_match_stats(_out)
             st.rerun()
     else:
         # idle
@@ -1287,6 +1362,7 @@ if st.session_state.run_state == "idle" and _run_requested:
     _t_stride = stride
     _t_mf = max_frames
     _t_sv = save_video
+    _t_q = st.session_state["ui_queue"]
 
     def _worker() -> None:
         rc = _run_pipeline_subprocess(
@@ -1299,6 +1375,7 @@ if st.session_state.run_state == "idle" and _run_requested:
             log_lines=_t_log,
             progress=_t_prog,
             proc_holder=_t_ph,
+            ui_queue=_t_q,
         )
         # Signal completion via the shared dict — NO st.session_state here.
         _t_ph["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1327,80 +1404,113 @@ if run_state == "idle":
 # ---- RUNNING ----
 elif run_state == "running":
 
-    # Check if the worker thread signalled completion via the shared dict.
-    # This runs on every rerun (triggered by the fragment timer below).
-    ph = st.session_state.proc_holder
-    if "return_code" in ph:
-        rc = ph["return_code"]
-        st.session_state.run_finished_at = ph.get("finished_at", "")
-        out_path = Path(st.session_state.output_dir)
-        if rc == 0:
-            st.session_state.run_state = "done"
-            st.session_state.outputs = _discover_outputs(out_path)
-        else:
-            st.session_state.run_state = "error"
-            st.session_state.last_error = f"Pipeline exited with code {rc}"
-        # Cache final stats into session_state so DONE/ERROR can use them
-        if out_path.exists():
-            st.session_state["stats_cache"] = _load_match_stats(out_path)
-        st.rerun()
-
     # --- Live-updating fragment: re-renders every 500ms without full rerun ---
     @st.fragment(run_every=timedelta(milliseconds=500))
     def _live_panel() -> None:
-        """Render progress, analytics, and console from shared data.
+        """Drain ui_queue, update live_metrics snapshot, and render.
 
         Runs as a Streamlit fragment so only this portion refreshes
         every 500ms; the rest of the page (sidebar, etc.) stays stable.
         """
-        prog = st.session_state.progress      # plain dict, written by worker
-        log_lines = st.session_state.log_lines  # plain list, written by worker
-        pct = prog.get("pct", 0)
+        ui_q: queue.Queue = st.session_state["ui_queue"]
+        lm: dict = st.session_state["live_metrics"]
 
-        # -- Progress bar --
+        # -- Drain all pending events from the queue --
+        terminal_event: dict | None = None
+        while True:
+            try:
+                evt = ui_q.get_nowait()
+            except queue.Empty:
+                break
+            etype = evt.get("type", "")
+            if etype == "progress":
+                lm["frame_idx"] = evt.get("frame_idx", lm["frame_idx"])
+                lm["total_frames"] = evt.get("total_frames", lm["total_frames"])
+                lm["fps"] = evt.get("fps", lm["fps"])
+                lm["eta_s"] = evt.get("eta_s", lm["eta_s"])
+            elif etype == "live_stats":
+                lm["frames_seen"] = evt.get("frames_seen", lm["frames_seen"])
+                lm["ball_detected_pct"] = evt.get("ball_detected_pct", lm["ball_detected_pct"])
+                lm["players_tracked"] = evt.get("players_tracked", lm["players_tracked"])
+                lm["possession_by_team"] = evt.get("possession_by_team", lm["possession_by_team"])
+                lm["passes_so_far"] = evt.get("passes_so_far", lm["passes_so_far"])
+                lm["stage"] = evt.get("stage", lm["stage"])
+            elif etype in ("done", "failed"):
+                terminal_event = evt
+
+        # -- Handle terminal events: transition out of running --
+        if terminal_event is not None:
+            ph = st.session_state.proc_holder
+            st.session_state.run_finished_at = ph.get(
+                "finished_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            out_path = Path(st.session_state.output_dir)
+            if terminal_event["type"] == "done":
+                st.session_state.run_state = "done"
+                st.session_state.outputs = _discover_outputs(out_path)
+            else:
+                rc = terminal_event.get("return_code", 1)
+                st.session_state.run_state = "error"
+                st.session_state.last_error = f"Pipeline exited with code {rc}"
+            if out_path.exists():
+                st.session_state["stats_cache"] = _load_match_stats(out_path)
+            st.rerun()
+
+        # Fallback: also check proc_holder in case queue event was missed
+        ph = st.session_state.proc_holder
+        if "return_code" in ph:
+            out_path = Path(st.session_state.output_dir)
+            rc = ph["return_code"]
+            st.session_state.run_finished_at = ph.get("finished_at", "")
+            if rc == 0:
+                st.session_state.run_state = "done"
+                st.session_state.outputs = _discover_outputs(out_path)
+            else:
+                st.session_state.run_state = "error"
+                st.session_state.last_error = f"Pipeline exited with code {rc}"
+            if out_path.exists():
+                st.session_state["stats_cache"] = _load_match_stats(out_path)
+            st.rerun()
+
+        # -- Render: progress bar --
+        pct = 0
+        if lm["total_frames"] > 0:
+            pct = int(lm["frame_idx"] / lm["total_frames"] * 100)
         st.progress(min(pct, 100))
 
-        # -- Pipeline metrics --
-        elapsed = time.time() - st.session_state.run_start_ts
-        mins, secs = divmod(int(elapsed), 60)
-        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+        # -- Status line --
+        f_done = lm["frame_idx"]
+        f_total = lm["total_frames"]
+        fps = lm["fps"]
+        eta = lm["eta_s"]
 
-        f_done = prog.get("frames_done", 0)
-        f_total = prog.get("frames_total", 0)
-        frames_str = f"{f_done} / {f_total}" if f_total else str(f_done) if f_done else "—"
+        if f_total > 0 and f_done > 0:
+            status_line = (
+                f"Processing frame {f_done}/{f_total} | "
+                f"{fps:.1f} FPS | ETA {eta:.0f}s"
+            )
+        elif f_done > 0:
+            status_line = f"Processing frame {f_done} | {fps:.1f} FPS"
+        else:
+            status_line = "Initializing pipeline..."
 
-        stage = prog.get("current_stage", "") or "—"
-        warns = prog.get("warn_count", 0)
-        errors = prog.get("error_count", 0)
+        st.markdown(f"**{status_line}**")
 
-        st.subheader("Pipeline Running")
-        st.caption(f"Started at {st.session_state.run_started_at}")
-
+        # -- Live metrics row --
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Elapsed", elapsed_str)
-        c2.metric("Frames", frames_str)
-        c3.metric("Stage", stage)
-        c4.metric("Progress", f"{pct}%")
+        c1.metric("Players", lm["players_tracked"])
+        c2.metric("Ball Detected", f"{lm['ball_detected_pct']:.0f}%")
+        poss = lm["possession_by_team"]
+        if poss:
+            poss_parts = [f"T{k}: {v:.0f}%" for k, v in sorted(poss.items())]
+            poss_label = " / ".join(poss_parts)
+        else:
+            poss_label = "—"
+        c3.metric("Possession", poss_label)
+        c4.metric("Passes", lm["passes_so_far"])
 
-        if warns or errors:
-            w1, w2 = st.columns(2)
-            if warns:
-                w1.metric("Warnings", warns)
-            if errors:
-                w2.metric("Errors", errors)
-
-        # -- Poll output artifacts for match analytics --
-        out_dir = Path(st.session_state.output_dir) if st.session_state.output_dir else None
-        if out_dir and out_dir.exists():
-            cached = _load_match_stats(out_dir)
-            if cached.get("team_stats") is not None or cached.get("events"):
-                _render_match_analytics(cached, read_only=True)
-
-        # -- Docked console --
-        st.markdown(
-            _render_console_html(log_lines, status="running"),
-            unsafe_allow_html=True,
-        )
+        # -- Developer console (collapsed) --
+        _render_developer_console(st.session_state.log_lines, status="running")
 
     _live_panel()
 
@@ -1409,73 +1519,256 @@ elif run_state == "done":
     out_dir = Path(st.session_state.output_dir)
     outputs = st.session_state.outputs
 
-    # -- Success banner --
-    st.success(
-        f"Pipeline finished successfully\n\n"
-        f"**Started:** {st.session_state.run_started_at}  \n"
-        f"**Finished:** {st.session_state.run_finished_at}  \n"
-        f"**Output folder:** `{out_dir}`"
-    )
-
-    # -- File list --
-    st.subheader("Output files")
-    if outputs:
-        for name, abs_path in outputs.items():
-            p = Path(abs_path)
-            if p.is_file():
-                size_kb = p.stat().st_size / 1024
-                size_str = f"{size_kb / 1024:.1f} MB" if size_kb > 1024 else f"{size_kb:.0f} KB"
-                st.markdown(f"- `{name}` — {size_str}")
-            else:
-                n_files = len(list(p.glob("*")))
-                st.markdown(f"- `{name}` — folder ({n_files} files)")
-    else:
-        st.info("No output files found.")
-
-    # -- Download buttons --
-    st.subheader("Downloads")
-    dl_cols = st.columns(3)
-    _downloadable = [
-        ("annotated.mp4", "video/mp4"),
-        ("run_report.json", "application/json"),
-        ("teams_summary.csv", "text/csv"),
-    ]
-    for idx, (fname, mime) in enumerate(_downloadable):
-        fpath = out_dir / fname
-        if fpath.exists() and fpath.stat().st_size > 0:
-            with dl_cols[idx % 3]:
-                st.download_button(
-                    label=f"Download {fname}",
-                    data=fpath.read_bytes(),
-                    file_name=fname,
-                    mime=mime,
-                )
-
     # -- Load all artifacts once for this page --
     match_stats = st.session_state.get("stats_cache") or _load_match_stats(out_dir)
-    has_analytics = (
-        match_stats.get("team_stats") is not None
-        or match_stats.get("team_df") is not None
-        or match_stats.get("events")
-    )
 
-    if has_analytics:
+    team_df = match_stats.get("team_stats") if "team_stats" in match_stats else match_stats.get("team_df")
+    player_df = match_stats.get("player_stats") if "player_stats" in match_stats else match_stats.get("player_df")
+    events_data = match_stats.get("events") or []
+    run_report = match_stats.get("run_report")
+    team_summary = match_stats.get("team_summary")
+    team_possession = match_stats.get("team_possession")
+
+    # =====================================================================
+    # A) Run Status Card
+    # =====================================================================
+    st.subheader("Run Status")
+    elapsed_sec = 0
+    total_frames = 0
+    run_status_str = "Complete"
+    warn_count = 0
+
+    if run_report:
+        cov = run_report.get("coverage", {})
+        elapsed_sec = cov.get("processing_time_sec", 0)
+        total_frames = cov.get("total_frames_processed", 0)
+        deg = run_report.get("degradation", {})
+        warn_count = len(deg.get("warnings", []))
+        confidence = deg.get("overall_confidence", "unknown")
+        if "good" in confidence:
+            run_status_str = "Good"
+        elif "low" in confidence:
+            run_status_str = "Degraded"
+        else:
+            run_status_str = "Low quality"
+
+    mins, secs = divmod(int(elapsed_sec), 60)
+    elapsed_display = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    rc1.metric("Elapsed", elapsed_display)
+    rc2.metric("Frames", total_frames)
+    rc3.metric("Status", run_status_str)
+    rc4.metric("Warnings", warn_count)
+
+    st.divider()
+
+    # =====================================================================
+    # B) Team Comparison
+    # =====================================================================
+    if team_df is not None and not team_df.empty and len(team_df) >= 2:
+        st.subheader("Team Comparison")
+
+        # Build possession lookup from team_possession.json as fallback
+        _tp_lookup: dict[int, float] = {}
+        if team_possession and isinstance(team_possession, dict):
+            for t in team_possession.get("teams", []):
+                if isinstance(t, dict) and "team_id" in t:
+                    _tp_lookup[t["team_id"]] = t.get("possession_pct", 0.0)
+
+        col_left, col_right = st.columns(2)
+        for col_idx, (_, row) in enumerate(team_df.iterrows()):
+            col = col_left if col_idx == 0 else col_right
+            with col:
+                tid = row.get("team_id", col_idx)
+                st.markdown(f"**Team {tid}**")
+
+                # Possession
+                poss_val = 0.0
+                if "possession_pct" in row and pd.notna(row["possession_pct"]) and row["possession_pct"] > 0:
+                    poss_val = float(row["possession_pct"])
+                elif tid in _tp_lookup:
+                    poss_val = _tp_lookup[tid]
+                st.metric("Possession", f"{poss_val:.1f}%")
+
+                # Distance (km)
+                dist_km = 0.0
+                if team_summary and isinstance(team_summary, dict):
+                    phys = team_summary.get("physical", {})
+                    tid_key = str(tid) if str(tid) in phys else tid
+                    if tid_key in phys and isinstance(phys[tid_key], dict):
+                        dist_km = phys[tid_key].get("total_distance_m", 0) / 1000.0
+                if dist_km == 0 and "total_distance_m" in row and pd.notna(row.get("total_distance_m")):
+                    dist_km = float(row["total_distance_m"]) / 1000.0
+                st.metric("Distance", f"{dist_km:.2f} km")
+
+                # Pass accuracy
+                pass_acc = 0.0
+                if "pass_completion_pct" in row and pd.notna(row.get("pass_completion_pct")):
+                    pass_acc = float(row["pass_completion_pct"])
+                st.metric("Pass Accuracy", f"{pass_acc:.1f}%")
+
+                # Interceptions
+                intercepts = 0
+                if "interceptions_won" in row and pd.notna(row.get("interceptions_won")):
+                    intercepts = int(row["interceptions_won"])
+                elif "interceptions" in row and pd.notna(row.get("interceptions")):
+                    intercepts = int(row["interceptions"])
+                st.metric("Interceptions", intercepts)
+
+            if col_idx >= 1:
+                break  # only two teams
+
+        # -- Horizontal possession bar between columns --
+        poss_values: list[tuple[int, float]] = []
+        if "possession_pct" in team_df.columns:
+            for _, row in team_df.iterrows():
+                tid = row.get("team_id", 0)
+                pct = row.get("possession_pct", 0.0)
+                if pd.notna(pct) and pct > 0:
+                    poss_values.append((int(tid), float(pct)))
+        if not poss_values and _tp_lookup:
+            for tid, pct in sorted(_tp_lookup.items()):
+                poss_values.append((tid, pct))
+
+        if len(poss_values) >= 2:
+            t0, p0 = poss_values[0]
+            t1, p1 = poss_values[1]
+            total_p = p0 + p1
+            if total_p > 0:
+                frac_0 = p0 / total_p
+                bar_html = (
+                    f'<div style="display:flex;align-items:center;margin:12px 0;">'
+                    f'<span style="width:80px;text-align:right;font-weight:600;">Team {t0}</span>'
+                    f'<div style="flex:1;height:28px;background:#333;border-radius:4px;margin:0 8px;overflow:hidden;display:flex;">'
+                    f'<div style="width:{frac_0 * 100:.1f}%;background:rgb(100,100,255);display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:600;">{p0:.1f}%</div>'
+                    f'<div style="width:{(1 - frac_0) * 100:.1f}%;background:rgb(255,100,100);display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:600;">{p1:.1f}%</div>'
+                    f'</div>'
+                    f'<span style="width:80px;font-weight:600;">Team {t1}</span>'
+                    f'</div>'
+                )
+                st.markdown(bar_html, unsafe_allow_html=True)
+
         st.divider()
-        st.subheader("Match Analytics")
-        _render_match_analytics(match_stats, key_prefix="done")
 
-    # -- Tabs for detailed results --
+    # =====================================================================
+    # C) Player Highlights — top 5 tables
+    # =====================================================================
+    if player_df is not None and not player_df.empty:
+        st.subheader("Player Highlights")
+
+        highlight_specs = [
+            ("distance_covered_m", "Top 5 by Distance", "Distance (m)", False),
+            ("top_speed_mps", "Top 5 by Speed", "Top Speed (m/s)", False),
+            ("touches", "Top 5 by Touches", "Touches", True),
+            ("passes", "Top 5 by Passes", "Passes", True),
+        ]
+
+        h_cols = st.columns(len(highlight_specs))
+        for i, (col_name, title, display_name, is_int) in enumerate(highlight_specs):
+            with h_cols[i]:
+                st.markdown(f"**{title}**")
+                if col_name in player_df.columns:
+                    df_hl = player_df.dropna(subset=[col_name]).copy()
+                    df_hl[col_name] = pd.to_numeric(df_hl[col_name], errors="coerce").fillna(0)
+                    top5 = df_hl.nlargest(5, col_name)
+                    if not top5.empty:
+                        show_cols = ["track_id"]
+                        if "team_id" in top5.columns:
+                            show_cols.append("team_id")
+                        show_cols.append(col_name)
+                        disp = top5[show_cols].copy()
+                        disp = disp.rename(columns={
+                            "track_id": "Player",
+                            "team_id": "Team",
+                            col_name: display_name,
+                        })
+                        if is_int:
+                            disp[display_name] = disp[display_name].astype(int)
+                        else:
+                            disp[display_name] = disp[display_name].round(1)
+                        st.dataframe(disp, hide_index=True, height=250)
+                    else:
+                        st.caption("No data")
+                else:
+                    st.caption("N/A")
+
+        st.divider()
+
+    # =====================================================================
+    # D) Full Player Table
+    # =====================================================================
+    if player_df is not None and not player_df.empty:
+        with st.expander("Full Player Stats"):
+            display = player_df.copy()
+            if "top_speed_mps" in display.columns:
+                display["top_speed_kmh"] = (display["top_speed_mps"] * 3.6).round(1)
+            if "avg_speed_mps" in display.columns:
+                display["avg_speed_kmh"] = (display["avg_speed_mps"] * 3.6).round(1)
+            drop_cols = ["heatmap_grid"]
+            if "top_speed_kmh" in display.columns:
+                drop_cols.append("top_speed_mps")
+            if "avg_speed_kmh" in display.columns:
+                drop_cols.append("avg_speed_mps")
+            display = display.drop(
+                columns=[c for c in drop_cols if c in display.columns],
+                errors="ignore",
+            )
+            rename = {k: v for k, v in _PLAYER_COL_RENAME.items() if k in display.columns}
+            display = display.rename(columns=rename)
+            st.dataframe(display, use_container_width=True)
+
+    # =====================================================================
+    # Artifacts & Downloads (in expander)
+    # =====================================================================
+    with st.expander("Artifacts Loaded"):
+        loaded = match_stats.get("loaded", [])
+        if loaded:
+            st.caption("Loaded: " + ", ".join(f"`{f}`" for f in loaded))
+        missing = match_stats.get("missing", [])
+        if missing:
+            st.warning("Missing: " + ", ".join(f"`{f}`" for f in missing))
+
+        if outputs:
+            for name, abs_path in outputs.items():
+                p = Path(abs_path)
+                if p.is_file():
+                    size_kb = p.stat().st_size / 1024
+                    size_str = f"{size_kb / 1024:.1f} MB" if size_kb > 1024 else f"{size_kb:.0f} KB"
+                    st.markdown(f"- `{name}` — {size_str}")
+                else:
+                    n_files = len(list(p.glob("*")))
+                    st.markdown(f"- `{name}` — folder ({n_files} files)")
+
+        # Download buttons
+        dl_cols = st.columns(3)
+        _downloadable = [
+            ("annotated.mp4", "video/mp4"),
+            ("run_report.json", "application/json"),
+            ("teams_summary.csv", "text/csv"),
+        ]
+        for idx, (fname, mime) in enumerate(_downloadable):
+            fpath = out_dir / fname
+            if fpath.exists() and fpath.stat().st_size > 0:
+                with dl_cols[idx % 3]:
+                    st.download_button(
+                        label=f"Download {fname}",
+                        data=fpath.read_bytes(),
+                        file_name=fname,
+                        mime=mime,
+                    )
+
+    # =====================================================================
+    # Detailed tabs (Run Report, Heatmaps, Events, Video, etc.)
+    # =====================================================================
     st.divider()
     tabs = st.tabs([
-        "Run Report", "Team Stats", "Player Stats", "Events",
-        "Heatmaps", "Confidence", "Detailed Stats", "Video", "Logs",
+        "Run Report", "Events", "Heatmaps", "Video", "Logs",
     ])
 
     with tabs[0]:
-        report = match_stats.get("run_report")
-        if report is not None:
-
-            cov = report.get("coverage", {})
+        if run_report:
+            cov = run_report.get("coverage", {})
             if cov:
                 st.subheader("Coverage")
                 c1, c2, c3, c4 = st.columns(4)
@@ -1489,9 +1782,8 @@ elif run_state == "done":
                 c6.metric("Processing Time", f"{cov.get('processing_time_sec', 0)}s")
                 c7.metric("Throughput", f"{cov.get('fps_throughput', 0)} fps")
 
-            deg = report.get("degradation", {})
+            deg = run_report.get("degradation", {})
             if deg:
-                st.subheader("Quality")
                 confidence = deg.get("overall_confidence", "unknown")
                 if "good" in confidence:
                     st.success(f"Overall confidence: {confidence}")
@@ -1503,80 +1795,14 @@ elif run_state == "done":
                     st.warning(w)
 
             with st.expander("Raw JSON"):
-                st.json(report)
+                st.json(run_report)
         else:
             st.info("run_report.json not found.")
 
-    # -- Team Stats (analytics) — uses already-loaded match_stats --
+    # -- Events --
     with tabs[1]:
-        tab_team_df = match_stats.get("team_stats") if "team_stats" in match_stats else match_stats.get("team_df")
-        if tab_team_df is not None and not tab_team_df.empty:
-            st.subheader("Team Analytics")
-            st.dataframe(tab_team_df, width="stretch")
-
-            # Possession bar
-            if "possession_pct" in tab_team_df.columns and "team_id" in tab_team_df.columns:
-                st.subheader("Possession")
-                for _, row in tab_team_df.iterrows():
-                    tid = row["team_id"]
-                    poss = row["possession_pct"]
-                    st.progress(min(poss / 100.0, 1.0), text=f"Team {tid}: {poss:.1f}%")
-
-            # xG display
-            if "xG_total" in tab_team_df.columns:
-                st.subheader("Expected Goals (xG)")
-                xg_cols = st.columns(len(tab_team_df))
-                for i, (_, row) in enumerate(tab_team_df.iterrows()):
-                    xg_cols[i].metric(f"Team {row['team_id']}", f"{row['xG_total']:.2f}")
-        else:
-            st.info("No team stats found.")
-
-    # -- Player Stats (analytics) — uses already-loaded match_stats --
-    with tabs[2]:
-        tab_player_df = match_stats.get("player_stats") if "player_stats" in match_stats else match_stats.get("player_df")
-        if tab_player_df is not None and not tab_player_df.empty:
-            st.subheader("Player Analytics")
-
-            # Top 5 fastest
-            _render_top_speed_players(tab_player_df)
-
-            sortable = [c for c in tab_player_df.columns if c not in ("track_id", "team_id", "confidence")]
-            if sortable:
-                sort_col = st.selectbox(
-                    "Sort by",
-                    sortable,
-                    index=0,
-                    key="done_player_sort_col",
-                )
-                ascending = st.checkbox("Ascending", value=False, key="done_player_ascending")
-                df_sorted = tab_player_df.sort_values(sort_col, ascending=ascending)
-            else:
-                df_sorted = tab_player_df
-            # Add km/h columns, drop m/s
-            display = df_sorted.copy()
-            if "top_speed_mps" in display.columns:
-                display["top_speed_kmh"] = (display["top_speed_mps"] * 3.6).round(1)
-            if "avg_speed_mps" in display.columns:
-                display["avg_speed_kmh"] = (display["avg_speed_mps"] * 3.6).round(1)
-            drop_cols = ["heatmap_grid"]
-            if "top_speed_kmh" in display.columns:
-                drop_cols.append("top_speed_mps")
-            if "avg_speed_kmh" in display.columns:
-                drop_cols.append("avg_speed_mps")
-            display = display.drop(columns=[c for c in drop_cols if c in display.columns], errors="ignore")
-            rename = {k: v for k, v in _PLAYER_COL_RENAME.items() if k in display.columns}
-            display = display.rename(columns=rename)
-            st.dataframe(display, width="stretch")
-        else:
-            st.info("No player stats found.")
-
-    # -- Events — uses already-loaded match_stats --
-    with tabs[3]:
-        events_data = match_stats.get("events") or []
         if events_data:
             st.subheader(f"Match Events ({len(events_data)} total)")
-
-            # Filter by type
             event_types = sorted(set(e.get("event_type", "unknown") for e in events_data))
             selected_types = st.multiselect(
                 "Filter event types",
@@ -1586,10 +1812,8 @@ elif run_state == "done":
             )
             filtered = [e for e in events_data if e.get("event_type") in selected_types]
             df_ev = pd.DataFrame(filtered)
-            st.dataframe(df_ev, width="stretch")
+            st.dataframe(df_ev, use_container_width=True)
 
-            # Summary counts
-            st.subheader("Event Summary")
             counts: dict[str, int] = {}
             for e in events_data:
                 et = e.get("event_type", "unknown")
@@ -1601,13 +1825,12 @@ elif run_state == "done":
             st.info("No events detected. Run the pipeline to generate events.")
 
     # -- Heatmaps --
-    with tabs[4]:
+    with tabs[2]:
         heatmap_dir = out_dir / "heatmaps"
         if heatmap_dir.exists():
             pngs = sorted(heatmap_dir.glob("*.png"))
             if pngs:
                 st.subheader("Heatmaps")
-                # Show in 2-column grid
                 cols = st.columns(2)
                 for i, png_path in enumerate(pngs):
                     with cols[i % 2]:
@@ -1615,62 +1838,10 @@ elif run_state == "done":
             else:
                 st.info("No heatmap images found.")
         else:
-            st.info("heatmaps/ folder not found. Run the pipeline to generate heatmaps.")
-
-    # -- Confidence & Coverage --
-    with tabs[5]:
-        conf_report = match_stats.get("run_report")
-        if conf_report is not None:
-            analytics_cov = conf_report.get("coverage", {}).get("analytics", {})
-
-            if analytics_cov and analytics_cov.get("status") != "no_data":
-                st.subheader("Analytics Confidence & Coverage")
-
-                ac1, ac2, ac3 = st.columns(3)
-                ac1.metric("Ball Detected", f"{analytics_cov.get('ball_detected_pct', 0)}%")
-                ac2.metric("Owner Assigned", f"{analytics_cov.get('ball_owner_pct', 0)}%")
-                ac3.metric("High Confidence", f"{analytics_cov.get('high_confidence_pct', 0)}%")
-
-                # Event counts
-                evt_counts = analytics_cov.get("event_counts", {})
-                if evt_counts:
-                    st.subheader("Event Counts")
-                    evt_cols = st.columns(min(len(evt_counts), 6))
-                    for i, (k, v) in enumerate(sorted(evt_counts.items())):
-                        evt_cols[i % len(evt_cols)].metric(k.title(), v)
-
-                # Warnings
-                warnings = analytics_cov.get("warnings", [])
-                if warnings:
-                    st.subheader("Warnings")
-                    for w in warnings:
-                        st.warning(w)
-                else:
-                    st.success("No analytics warnings.")
-            else:
-                st.info("No analytics coverage data available.")
-        else:
-            st.info("run_report.json not found.")
-
-    # -- Detailed Stats --
-    with tabs[6]:
-        stats_path = out_dir / "stats"
-        if stats_path.exists():
-            json_files = sorted(stats_path.glob("*.json"))
-            if json_files:
-                for jf in json_files:
-                    with st.expander(jf.stem):
-                        try:
-                            st.json(json.loads(jf.read_text(encoding="utf-8")))
-                        except Exception as e:
-                            st.error(f"Error reading {jf.name}: {e}")
-            else:
-                st.info("No stat files in stats/ folder.")
-        else:
-            st.info("stats/ folder not found.")
+            st.info("heatmaps/ folder not found.")
 
     # -- Video --
-    with tabs[7]:
+    with tabs[3]:
         vid = out_dir / "annotated.mp4"
         if vid.exists() and vid.stat().st_size > 0:
             st.video(str(vid))
@@ -1678,17 +1849,11 @@ elif run_state == "done":
             st.info("No annotated video. Enable 'Save annotated video' to produce one.")
 
     # -- Logs --
-    with tabs[8]:
+    with tabs[4]:
         st.code("\n".join(st.session_state.log_lines), language="text")
 
-    # Bottom padding so sticky console doesn't obscure content
-    st.markdown('<div style="padding-bottom: 320px;"></div>', unsafe_allow_html=True)
-
-    # -- Docked console at bottom --
-    st.markdown(
-        _render_console_html(st.session_state.log_lines, status="done"),
-        unsafe_allow_html=True,
-    )
+    # -- Developer console (collapsed) --
+    _render_developer_console(st.session_state.log_lines, status="done")
 
 # ---- CANCELED ----
 elif run_state == "canceled":
@@ -1700,14 +1865,45 @@ elif run_state == "canceled":
         f"Partial artifacts (if any) are preserved in the output directory."
     )
 
-    # Bottom padding so sticky console doesn't obscure content
-    st.markdown('<div style="padding-bottom: 320px;"></div>', unsafe_allow_html=True)
+    # Show partial artifacts if output dir exists
+    _cancel_out = Path(st.session_state.output_dir) if st.session_state.output_dir else None
+    if _cancel_out and _cancel_out.exists():
+        _cancel_outputs = st.session_state.outputs or _discover_outputs(_cancel_out)
+        _cancel_stats = st.session_state.get("stats_cache") or _load_match_stats(_cancel_out)
 
-    # Docked console
-    st.markdown(
-        _render_console_html(st.session_state.log_lines, status="canceled"),
-        unsafe_allow_html=True,
-    )
+        _cancel_team_df = _cancel_stats.get("team_stats") or _cancel_stats.get("team_df")
+        _cancel_player_df = _cancel_stats.get("player_stats") or _cancel_stats.get("player_df")
+
+        has_partial = (
+            _cancel_team_df is not None
+            or _cancel_player_df is not None
+            or _cancel_stats.get("events")
+        )
+
+        if has_partial:
+            st.divider()
+            st.subheader("Partial Results")
+            _render_match_analytics(_cancel_stats, key_prefix="canceled", read_only=True)
+
+        with st.expander("Artifacts Loaded"):
+            loaded = _cancel_stats.get("loaded", [])
+            if loaded:
+                st.caption("Loaded: " + ", ".join(f"`{f}`" for f in loaded))
+            missing = _cancel_stats.get("missing", [])
+            if missing:
+                st.warning("Missing: " + ", ".join(f"`{f}`" for f in missing))
+            if _cancel_outputs:
+                for name, abs_path in _cancel_outputs.items():
+                    p = Path(abs_path)
+                    if p.is_file():
+                        size_kb = p.stat().st_size / 1024
+                        size_str = f"{size_kb / 1024:.1f} MB" if size_kb > 1024 else f"{size_kb:.0f} KB"
+                        st.markdown(f"- `{name}` — {size_str}")
+                    else:
+                        n_files = len(list(p.glob("*")))
+                        st.markdown(f"- `{name}` — folder ({n_files} files)")
+
+    _render_developer_console(st.session_state.log_lines, status="canceled")
 
 # ---- ERROR ----
 elif run_state == "error":
@@ -1717,12 +1913,4 @@ elif run_state == "error":
         f"**Started:** {st.session_state.run_started_at}  \n"
         f"**Stopped:** {st.session_state.run_finished_at}"
     )
-
-    # Bottom padding so sticky console doesn't obscure content
-    st.markdown('<div style="padding-bottom: 320px;"></div>', unsafe_allow_html=True)
-
-    # Docked console
-    st.markdown(
-        _render_console_html(st.session_state.log_lines, status="error"),
-        unsafe_allow_html=True,
-    )
+    _render_developer_console(st.session_state.log_lines, status="error")

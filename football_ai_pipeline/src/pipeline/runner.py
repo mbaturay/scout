@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -176,6 +177,17 @@ class PipelineRunner:
         if max_frames:
             estimated_total = min(estimated_total, max_frames)
 
+        # Rolling counters for lightweight live stats (emitted every N frames)
+        _LIVE_STATS_EVERY = self.config.get("pipeline", {}).get(
+            "live_stats_interval", 10,
+        )
+        _ls_frames_seen = 0
+        _ls_ball_detected = 0
+        _ls_players_current = 0
+        _ls_possession: dict[int, int] = {}  # team_id -> frames owned
+        _ls_passes = 0
+        _ls_stage = "Processing frames"
+
         for frame_idx, timestamp, image in tqdm(
             self.reader.frames(),
             desc="Processing frames",
@@ -186,6 +198,37 @@ class PipelineRunner:
 
             frame_state = self._process_frame(frame_idx, timestamp, image, cam_rec)
             self._update_counters(frame_state)
+
+            # -- Update rolling counters (cheap field reads, no recompute) --
+            _ls_frames_seen += 1
+            if frame_state.ball is not None:
+                _ls_ball_detected += 1
+            _ls_players_current = len(frame_state.players)
+
+            owner_info = frame_state.analytics.get("ball_owner")
+            if owner_info and owner_info.get("owner_team_id") is not None:
+                tid = owner_info["owner_team_id"]
+                _ls_possession[tid] = _ls_possession.get(tid, 0) + 1
+
+            # Emit structured live-stats line every N frames
+            if _ls_frames_seen % _LIVE_STATS_EVERY == 0:
+                _ls_poss_pcts: dict[str, float] = {}
+                if _ls_frames_seen > 0:
+                    for tid, cnt in _ls_possession.items():
+                        _ls_poss_pcts[str(tid)] = round(
+                            cnt / _ls_frames_seen * 100, 1,
+                        )
+                print(
+                    f"[LIVE_STATS] {{"
+                    f"\"frames_seen\":{_ls_frames_seen},"
+                    f"\"ball_detected_pct\":{round(_ls_ball_detected / _ls_frames_seen * 100, 1)},"
+                    f"\"players_tracked_current\":{_ls_players_current},"
+                    f"\"possession_by_team\":{json.dumps(_ls_poss_pcts)},"
+                    f"\"passes_so_far\":{_ls_passes},"
+                    f"\"stage\":\"{_ls_stage}\""
+                    f"}}",
+                    flush=True,
+                )
 
             # Export frame data
             self.exporter.write_frame(frame_state)
