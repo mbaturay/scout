@@ -1,0 +1,15 @@
+# Local/editor
+.claude/
+.venv/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Test/cache artifacts
+.pytest_cache/
+
+# Generated outputs
+football_ai_pipeline/out/

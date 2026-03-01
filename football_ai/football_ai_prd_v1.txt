@@ -1,0 +1,220 @@
+TITLE
+Football Match Analytics Engine (Single Broadcast Video → Advanced Stats)
+
+VERSION
+1.0.0 (MVP)
+
+PRODUCT DEFINITION (WHAT WE ARE BUILDING)
+A local-first, free, open-source football analytics engine that ingests a full match video recording (broadcast or single-camera wide angle) and outputs:
+
+1. structured tracking data (players + ball) mapped to pitch coordinates,
+2. a curated set of advanced match statistics and tactical insights,
+3. an annotated video, and
+4. machine-readable exports (JSON/CSV/Parquet) for custom analysis.
+
+PRIMARY USERS
+
+* Analysts / hobbyists / coaches who have a full-match video and want advanced insights without manual tagging.
+* Developers who want a stats-ready dataset for their own models and dashboards.
+
+GOALS (WHAT “AMAZING STATS” MEANS IN MVP)
+The MVP must produce, at minimum, these stats from a full match video:
+
+A) Physical & Movement
+
+* Estimated distance covered per player (pitch-mapped)
+* Sprint counts (threshold-based) + top speed
+* Team tempo: median ball speed, median player speed by team
+
+B) Spatial & Tactical Shape
+
+* Team centroid over time (attack/defense phases)
+* Team width/length and compactness (per minute + rolling window)
+* Defensive line height estimate (per team, per window)
+
+C) Ball Progression & Territory
+
+* Ball progression rate (m/s toward goal)
+* Time in thirds (defensive/middle/attacking third)
+* Possession proxy (time ball is nearest to team / controlled zone heuristic)
+
+D) Pressure & Control (proxy models, no event labels needed)
+
+* Pitch control (Voronoi-based) per frame and team control ratio
+* Pressure index on ball carrier: nearby opponents within radius + closing speed
+
+E) Threat / Danger
+
+* xT (expected threat) from ball movement using an open xT grid
+* Threat by zone occupancy (zone-based heuristics)
+
+OUTPUTS MUST BE:
+
+* Per-frame time series
+* Per-player aggregates (match totals)
+* Per-team aggregates (match totals)
+* Optional rolling-window summaries
+
+NON-GOALS (OUT OF SCOPE FOR MVP)
+
+* Perfect event detection with ground-truth accuracy
+* Multi-camera stitching
+* Player identity / jersey number OCR
+* Real-time live processing
+
+INPUTS & ASSUMPTIONS
+Supported video types:
+
+* Full match recording, ideally 720p+
+* Broadcast feed OR single static wide-angle camera
+* Variable frame rate allowed
+
+Known hard problems (must handle gracefully):
+
+* Camera cuts/replays/closeups
+* Motion blur and occlusions
+* Ball missing intermittently
+* Pitch keypoints not visible in some frames
+
+The system must:
+
+* Detect non-play frames and mark them
+* Continue tracking across short occlusions
+* Provide confidence scores for analytics reliability
+
+SUCCESS METRICS (ACCEPTANCE CRITERIA)
+A run is considered successful if:
+
+Pipeline
+
+* CLI completes without crash on full match video
+* Produces annotated video + exports + summary report
+* Exports are schema-stable
+
+Tracking/Mapping Quality
+
+* Homography available for ≥60% of in-play frames
+* Ball positions available for ≥40% of in-play frames
+* Player tracks stable enough for rolling movement stats
+
+Stats Quality
+
+* All MVP stats computed and included in outputs
+* Each stat includes confidence indicator
+
+SYSTEM CONSTRAINTS
+
+* Free/open-source dependencies only
+* No paid APIs
+* Runs locally on CPU; GPU optional
+* Windows supported
+
+FUNCTIONAL REQUIREMENTS
+
+FR1 — Video Ingestion
+
+* Load video, extract fps, frame count, resolution
+* Generate frames with configurable stride
+* Output metadata.json
+
+FR2 — In-play Filter
+
+* Classify frames as IN_PLAY vs NOT_IN_PLAY
+* Store frame flags
+
+FR3 — Object Detection
+
+* Detect player, goalkeeper, referee, ball
+* Load weights locally
+
+FR4 — Tracking
+
+* Assign persistent track IDs
+* Store tracking confidence metrics
+
+FR5 — Team Classification
+
+* Assign team_id ∈ {0,1}
+* Provide clustering confidence
+* Goalkeeper resolution heuristic
+
+FR6 — Keypoints & Homography
+
+* Detect 32 pitch landmarks
+* Compute homography + quality score
+* Expose frame↔pitch transforms
+
+FR7 — Pitch-Mapped Positions
+
+* Convert positions to pitch coordinates
+* Smooth ball trajectory
+* Interpolate short gaps
+
+FR8 — Analytics (MVP Stats)
+
+* Implement all stats in GOALS A–E
+* Output per-frame + aggregates + confidence
+
+FR9 — Visualization
+
+* Annotated video with IDs, team colors, ball marker
+* Optional radar overlay
+
+FR10 — Exports
+Write to out/:
+
+* frames.jsonl or Parquet
+* players_summary.csv
+* teams_summary.csv
+* stats folder
+* run_report.json (coverage + quality metrics)
+
+FR11 — CLI
+python -m football_ai_pipeline --config configs/default.yaml --input <video.mp4> --output <out_dir>
+
+DATA MODEL (SCHEMA REQUIREMENTS)
+FrameState minimum fields:
+
+* frame_idx, timestamp_sec
+* flags {in_play, reasons}
+* detections
+* tracks
+* team_assignments
+* keypoints + confidences
+* homography + quality
+* pitch positions + quality
+* ball_pitch + quality
+
+TECHNICAL ARCHITECTURE
+football_ai_pipeline/
+
+* **main**.py
+* configs/default.yaml
+* src/
+
+  * data_models.py
+  * video_io/
+  * segmentation/
+  * detection/
+  * tracking/
+  * team_classifier/
+  * keypoints/
+  * homography/
+  * transforms/
+  * stats/
+  * pipeline/runner.py
+* tests/
+* README.md
+* requirements.txt
+
+DEPENDENCIES (FREE ONLY)
+
+* numpy, scipy, scikit-learn, opencv-python, shapely, matplotlib
+* optional: pytorch/ultralytics, supervision, umap-learn
+
+DELIVERABLES
+
+* Working repo
+* Sample output folder
+* Tests passing with pytest
+* Documented limitations

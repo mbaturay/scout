@@ -1,0 +1,97 @@
+# Football AI Pipeline — Default Configuration
+# ================================================
+
+video:
+  stride: 2                    # Process every Nth frame (1 = all frames)
+  max_frames: null              # null = process all frames
+  target_fps: null              # null = use source fps / stride
+
+pitch:
+  length: 105.0                 # metres (FIFA standard)
+  width: 68.0                   # metres (FIFA standard)
+
+detection:
+  model: "yolov8n"              # ultralytics model name (for reference only)
+  weights: "models/yolo/yolov8n.pt"   # local path to .pt weights; resolved relative to package root
+  confidence: 0.25              # minimum detection confidence
+  iou_threshold: 0.45           # NMS IoU threshold
+  device: "auto"                # auto | cpu | cuda | mps
+
+tracking:
+  tracker: "bytetrack"          # bytetrack (via supervision)
+  track_activation_threshold: 0.25
+  lost_track_buffer: 30         # frames to keep lost tracks
+  minimum_matching_threshold: 0.8
+  frame_rate: 30                # used by tracker internals
+
+team_classifier:
+  method: "kmeans"              # kmeans | gmm
+  n_clusters: 2
+  color_space: "hsv"            # hsv | lab | rgb
+  sample_frames: 50             # frames to sample for initial clustering
+  goalkeeper_heuristic: true
+
+keypoints:
+  model: "keypoint_detector"    # placeholder model name
+  weights: null                 # path to keypoint weights
+  confidence: 0.5
+  num_keypoints: 32
+
+homography:
+  method: "dlt"                 # dlt | ransac
+  min_points: 4
+  quality_threshold: 0.6        # minimum homography quality to accept
+  smoothing_window: 5           # temporal smoothing window (frames)
+
+transforms:
+  ball_smoothing_window: 5      # median filter window for ball trajectory
+  interpolation_max_gap: 10     # max frames to interpolate across
+  coordinate_system: "pitch"    # pitch | image
+
+stats:
+  sprint_speed_threshold: 7.0   # m/s — above this = sprint
+  high_speed_threshold: 5.5     # m/s — above this = high-speed run
+  pressure_radius: 5.0          # metres — opponents within this radius count
+  rolling_window_sec: 300       # 5-minute rolling window
+  xt_grid: "karun_singh_12x8"   # xT grid to use
+  thirds_boundaries: [35.0, 70.0]  # pitch length split into thirds
+
+segmentation:
+  method: "heuristic"           # heuristic | model
+  scene_change_threshold: 30.0  # pixel-diff threshold for scene cuts
+  min_play_duration: 30         # minimum consecutive in-play frames
+
+visualization:
+  enabled: true
+  draw_ids: true
+  draw_ball: true
+  draw_team_colors: true
+  radar_overlay: false
+  output_codec: "mp4v"
+  output_fps: null               # null = match source
+
+exports:
+  format: "jsonl"               # jsonl | parquet
+  players_summary: true
+  teams_summary: true
+  stats_folder: true
+  run_report: true
+
+analytics:
+  left_to_right: true              # attacking direction: true = left-to-right
+  pitch_threshold_m: 5.0           # max distance (m) for ball ownership on pitch
+  pixel_threshold_px: 80.0         # fallback max distance (px) when no homography
+  hysteresis_frames: 3             # consecutive frames to switch ball owner
+  pass_min_distance_m: 3.0         # min ball travel (m) to count as a pass
+  pass_max_gap_sec: 3.0            # max time between owners for a pass
+  inflight_min_frames: 2           # min no-owner frames between owners for interception
+  shot_min_speed_mps: 5.0          # min ball speed (m/s) to tag as shot
+  press_radius_m: 10.0             # radius (m) for press intensity calculation
+  heatmap_grid_x: 21               # heatmap grid columns
+  heatmap_grid_y: 14               # heatmap grid rows
+  top_n_player_heatmaps: 5         # generate heatmap PNGs for top N players
+
+pipeline:
+  log_level: "INFO"
+  checkpoint_interval: 500       # save intermediate state every N frames
+  fail_on_missing_weights: false # false = use fallback/dummy; true = raise error
