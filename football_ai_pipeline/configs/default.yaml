@@ -70,6 +70,12 @@ visualization:
   output_codec: "mp4v"
   output_fps: null               # null = match source
 
+overlay:
+  show_speed: true                # per-player speed in km/h
+  show_distance: true             # per-player cumulative distance (m)
+  show_ball_control: true         # team ball control % bar (bottom right)
+  show_camera_motion_debug: false # camera dx/dy debug text (top right)
+
 exports:
   format: "jsonl"               # jsonl | parquet
   players_summary: true
@@ -78,6 +84,7 @@ exports:
   run_report: true
 
 analytics:
+  smoothing_alpha: 0.35             # EMA α for position smoothing (0 < α ≤ 1)
   left_to_right: true              # attacking direction: true = left-to-right
   pitch_threshold_m: 5.0           # max distance (m) for ball ownership on pitch
   pixel_threshold_px: 80.0         # fallback max distance (px) when no homography

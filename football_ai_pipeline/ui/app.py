@@ -523,6 +523,8 @@ _PLAYER_COL_RENAME: dict[str, str] = {
     "distance_covered_m": "Distance (m)",
     "avg_speed_mps": "Avg Speed (m/s)",
     "top_speed_mps": "Top Speed (m/s)",
+    "avg_speed_kmh": "Avg Speed (km/h)",
+    "top_speed_kmh": "Top Speed (km/h)",
     "touches": "Touches",
     "receptions": "Receptions",
     "passes": "Passes",
@@ -535,6 +537,164 @@ _PLAYER_COL_RENAME: dict[str, str] = {
     "pass_count": "Passes",
     "shots_count": "Shots",
 }
+
+
+def _render_quality_badge(run_report: dict[str, Any]) -> None:
+    """Render an Analytics Quality badge from run_report data."""
+    cov = run_report.get("coverage", {})
+    analytics = cov.get("analytics", {})
+    motion = cov.get("motion", {})
+    cam = cov.get("camera_motion", {})
+
+    checks: list[tuple[str, bool]] = []
+
+    # FPS check
+    fps_est = motion.get("avg_fps_estimate", 0)
+    if fps_est > 0:
+        fps_ok = 10 <= fps_est <= 60
+        checks.append((f"FPS {fps_est:.0f} Hz", fps_ok))
+
+    # Camera motion check
+    cam_good_pct = cam.get("good_estimate_pct", 0)
+    if cam_good_pct > 0 or cam.get("total_frames", 0) > 0:
+        cam_ok = cam_good_pct >= 70
+        checks.append((f"Camera motion {cam_good_pct:.0f}% good", cam_ok))
+
+    # Ball coverage check
+    ball_pct = cov.get("ball_position_available_pct", 0)
+    if ball_pct > 0 or cov.get("total_frames_processed", 0) > 0:
+        ball_ok = ball_pct >= 40
+        checks.append((f"Ball coverage {ball_pct:.0f}%", ball_ok))
+
+    if not checks:
+        return
+
+    all_ok = all(ok for _, ok in checks)
+    badge_color = "green" if all_ok else "orange"
+    badge_text = "GOOD" if all_ok else "DEGRADED"
+
+    badge_html = f'<span style="background:{badge_color};color:white;padding:2px 10px;border-radius:4px;font-weight:700;font-size:13px;">Analytics Quality: {badge_text}</span>'
+    items_html = "  ".join(
+        f'<span style="color:{"#2ecc71" if ok else "#e74c3c"};">{"&#10003;" if ok else "&#10007;"} {label}</span>'
+        for label, ok in checks
+    )
+    st.markdown(f"{badge_html} &nbsp; {items_html}", unsafe_allow_html=True)
+
+
+def _render_ball_control_bar(
+    team_df: Any,
+    tp_lookup: dict[int, float],
+    team_possession: dict[str, Any] | None,
+) -> None:
+    """Render a two-sided ball control progress bar."""
+    poss_values: list[tuple[int, float]] = []
+
+    # Try team_df first
+    if team_df is not None and "possession_pct" in team_df.columns:
+        for _, row in team_df.iterrows():
+            tid = row.get("team_id", 0)
+            pct = row.get("possession_pct", 0.0)
+            if pd.notna(pct) and pct > 0:
+                poss_values.append((tid, float(pct)))
+
+    # Fallback to team_possession.json
+    if not poss_values and tp_lookup:
+        for tid, pct in sorted(tp_lookup.items()):
+            poss_values.append((tid, pct))
+
+    if len(poss_values) >= 2:
+        st.markdown("#### Ball Control")
+        t0, p0 = poss_values[0]
+        t1, p1 = poss_values[1]
+        total = p0 + p1
+        if total > 0:
+            frac_0 = p0 / total
+            bar_html = (
+                f'<div style="display:flex;align-items:center;margin-bottom:8px;">'
+                f'<span style="width:80px;text-align:right;font-weight:600;">Team {t0}</span>'
+                f'<div style="flex:1;height:24px;background:#333;border-radius:4px;margin:0 8px;overflow:hidden;display:flex;">'
+                f'<div style="width:{frac_0 * 100:.1f}%;background:rgb(100,100,255);display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:600;">{p0:.1f}%</div>'
+                f'<div style="width:{(1 - frac_0) * 100:.1f}%;background:rgb(255,100,100);display:flex;align-items:center;justify-content:center;color:white;font-size:12px;font-weight:600;">{p1:.1f}%</div>'
+                f'</div>'
+                f'<span style="width:80px;font-weight:600;">Team {t1}</span>'
+                f'</div>'
+            )
+            st.markdown(bar_html, unsafe_allow_html=True)
+
+        # Ball state breakdown (controlled/loose/air)
+        if team_possession and isinstance(team_possession, dict):
+            ctrl_pct = team_possession.get("controlled_pct", 0)
+            loose_pct = team_possession.get("loose_pct", 0)
+            air_pct = team_possession.get("air_pct", 0)
+            if ctrl_pct > 0 or loose_pct > 0 or air_pct > 0:
+                st.caption(
+                    f"Ball state: controlled {ctrl_pct:.0f}% | "
+                    f"loose {loose_pct:.0f}% | air {air_pct:.0f}%"
+                )
+
+
+def _render_team_distance(team_df: Any, team_summary: dict | None) -> None:
+    """Render total distance per team in km."""
+    distances: list[tuple[int, float]] = []
+
+    # Try team_summary physical stats
+    if team_summary and isinstance(team_summary, dict):
+        physical = team_summary.get("physical", {})
+        if isinstance(physical, dict):
+            for tid, pstats in sorted(physical.items()):
+                if isinstance(pstats, dict) and "total_distance_m" in pstats:
+                    distances.append((tid, pstats["total_distance_m"] / 1000.0))
+
+    # Fallback: sum from team_df if it has distance
+    if not distances and team_df is not None and "total_distance_m" in team_df.columns:
+        for _, row in team_df.iterrows():
+            tid = row.get("team_id", 0)
+            dist = row.get("total_distance_m", 0)
+            if pd.notna(dist) and dist > 0:
+                distances.append((tid, dist / 1000.0))
+
+    if distances:
+        st.markdown("##### Total Distance")
+        d_cols = st.columns(len(distances))
+        for i, (tid, km) in enumerate(distances):
+            d_cols[i].metric(f"Team {tid}", f"{km:.2f} km")
+
+
+def _render_top_speed_players(player_df: Any) -> None:
+    """Render top 5 fastest players by top speed in km/h."""
+    speed_col = None
+    for col in ("top_speed_mps", "top_speed_kmh"):
+        if col in player_df.columns:
+            speed_col = col
+            break
+    if speed_col is None:
+        return
+
+    df = player_df.dropna(subset=[speed_col]).copy()
+    if df.empty:
+        return
+
+    if speed_col == "top_speed_mps":
+        df["_kmh"] = df[speed_col] * 3.6
+    else:
+        df["_kmh"] = df[speed_col]
+
+    top5 = df.nlargest(5, "_kmh")
+    if top5.empty:
+        return
+
+    st.markdown("#### Top 5 Fastest Players")
+    cols = st.columns(min(5, len(top5)))
+    for i, (_, row) in enumerate(top5.iterrows()):
+        with cols[i]:
+            tid = row.get("track_id", "?")
+            team = row.get("team_id", "?")
+            kmh = row["_kmh"]
+            dist = row.get("distance_covered_m")
+            label = f"#{tid} (Team {team})"
+            st.metric(label, f"{kmh:.1f} km/h")
+            if dist is not None and pd.notna(dist):
+                st.caption(f"{dist:.0f} m covered")
 
 
 def _render_match_analytics(
@@ -577,6 +737,11 @@ def _render_match_analytics(
     if missing:
         st.warning("Missing: " + ", ".join(f"`{f}`" for f in missing))
 
+    # -- Analytics Quality Badge --
+    run_report = stats.get("run_report")
+    if run_report:
+        _render_quality_badge(run_report)
+
     # -- Team stats cards --
     if team_df is not None and not team_df.empty:
         st.markdown("#### Team Overview")
@@ -606,21 +771,21 @@ def _render_match_analytics(
                     if "pass_completion_pct" in row and pd.notna(row["pass_completion_pct"]):
                         acc_str = f" ({row['pass_completion_pct']:.0f}% acc)"
                     st.metric("Passes", f"{int(row['pass_count'])}{acc_str}")
+                if "interceptions_won" in row and pd.notna(row["interceptions_won"]):
+                    st.metric("Interceptions Won", int(row["interceptions_won"]))
+                elif "interceptions" in row:
+                    st.metric("Interceptions", int(row["interceptions"]))
                 if "shots_count" in row:
                     st.metric("Shots", int(row["shots_count"]))
-                if "interceptions" in row:
-                    st.metric("Interceptions", int(row["interceptions"]))
                 if "tackles" in row:
                     st.metric("Tackles", int(row["tackles"]))
                 if "touches" in row:
                     st.metric("Touches", int(row["touches"]))
-                if "press_intensity" in row:
-                    st.metric("Press Intensity", f"{row['press_intensity']:.2f}")
-                if "territory_avg_x" in row:
-                    st.metric("Territory Avg X", f"{row['territory_avg_x']:.1f}m")
+
+        # -- Two-sided ball control bar --
+        _render_ball_control_bar(team_df, _tp_lookup, team_possession)
 
         # -- Ball coverage line --
-        run_report = stats.get("run_report")
         if run_report:
             cov = run_report.get("coverage", {})
             analytics = cov.get("analytics", {})
@@ -645,6 +810,9 @@ def _render_match_analytics(
                     f"({tp_owned / max(det_frames, 1) * 100:.0f}%)"
                 )
 
+        # -- Team distance (km) --
+        _render_team_distance(team_df, team_summary)
+
         # Enrichment from team_summary (physical stats from stats/team_summary.json)
         if team_summary and isinstance(team_summary, dict):
             physical = team_summary.get("physical")
@@ -656,11 +824,13 @@ def _render_match_analytics(
                         st.markdown(f"**Team {tid}**")
                         if isinstance(pstats, dict):
                             if "total_distance_m" in pstats:
-                                st.metric("Total Distance", f"{pstats['total_distance_m']:.0f}m")
+                                km = pstats["total_distance_m"] / 1000.0
+                                st.metric("Total Distance", f"{km:.2f} km")
                             if "total_sprints" in pstats:
                                 st.metric("Sprints", int(pstats["total_sprints"]))
                             if "team_top_speed_mps" in pstats:
-                                st.metric("Top Speed", f"{pstats['team_top_speed_mps']:.1f} m/s")
+                                kmh = pstats["team_top_speed_mps"] * 3.6
+                                st.metric("Top Speed", f"{kmh:.1f} km/h")
                             if "num_players_tracked" in pstats:
                                 st.metric("Players Tracked", int(pstats["num_players_tracked"]))
 
@@ -684,6 +854,10 @@ def _render_match_analytics(
         for i, (etype, cnt) in enumerate(sorted(counts.items())):
             evt_cols[i % len(evt_cols)].metric(etype.replace("_", " ").title(), cnt)
 
+    # -- Top 5 fastest players --
+    if player_df is not None and not player_df.empty:
+        _render_top_speed_players(player_df)
+
     # -- Player stats table --
     if player_df is not None and not player_df.empty:
         st.markdown("#### Player Stats")
@@ -697,8 +871,19 @@ def _render_match_analytics(
             if team_filter != "All":
                 tid = int(team_filter.split()[-1])
                 player_df = player_df[player_df["team_id"] == tid]
-        # Rename columns for readability, drop heatmap_grid if present
-        display_df = player_df.drop(columns=["heatmap_grid"], errors="ignore")
+        # Add km/h columns if m/s columns exist
+        display_df = player_df.copy()
+        if "top_speed_mps" in display_df.columns:
+            display_df["top_speed_kmh"] = (display_df["top_speed_mps"] * 3.6).round(1)
+        if "avg_speed_mps" in display_df.columns:
+            display_df["avg_speed_kmh"] = (display_df["avg_speed_mps"] * 3.6).round(1)
+        # Drop m/s columns in favour of km/h, and heatmap_grid
+        drop_cols = ["heatmap_grid"]
+        if "top_speed_kmh" in display_df.columns:
+            drop_cols.append("top_speed_mps")
+        if "avg_speed_kmh" in display_df.columns:
+            drop_cols.append("avg_speed_mps")
+        display_df = display_df.drop(columns=[c for c in drop_cols if c in display_df.columns], errors="ignore")
         rename = {k: v for k, v in _PLAYER_COL_RENAME.items() if k in display_df.columns}
         display_df = display_df.rename(columns=rename)
         st.dataframe(display_df, width="stretch", height=250)
@@ -1351,6 +1536,10 @@ elif run_state == "done":
         tab_player_df = match_stats.get("player_stats") if "player_stats" in match_stats else match_stats.get("player_df")
         if tab_player_df is not None and not tab_player_df.empty:
             st.subheader("Player Analytics")
+
+            # Top 5 fastest
+            _render_top_speed_players(tab_player_df)
+
             sortable = [c for c in tab_player_df.columns if c not in ("track_id", "team_id", "confidence")]
             if sortable:
                 sort_col = st.selectbox(
@@ -1363,8 +1552,18 @@ elif run_state == "done":
                 df_sorted = tab_player_df.sort_values(sort_col, ascending=ascending)
             else:
                 df_sorted = tab_player_df
-            # Rename for display
-            display = df_sorted.drop(columns=["heatmap_grid"], errors="ignore")
+            # Add km/h columns, drop m/s
+            display = df_sorted.copy()
+            if "top_speed_mps" in display.columns:
+                display["top_speed_kmh"] = (display["top_speed_mps"] * 3.6).round(1)
+            if "avg_speed_mps" in display.columns:
+                display["avg_speed_kmh"] = (display["avg_speed_mps"] * 3.6).round(1)
+            drop_cols = ["heatmap_grid"]
+            if "top_speed_kmh" in display.columns:
+                drop_cols.append("top_speed_mps")
+            if "avg_speed_kmh" in display.columns:
+                drop_cols.append("avg_speed_mps")
+            display = display.drop(columns=[c for c in drop_cols if c in display.columns], errors="ignore")
             rename = {k: v for k, v in _PLAYER_COL_RENAME.items() if k in display.columns}
             display = display.rename(columns=rename)
             st.dataframe(display, width="stretch")

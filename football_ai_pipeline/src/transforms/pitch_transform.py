@@ -11,6 +11,7 @@ from typing import Any, Optional
 import numpy as np
 from scipy.ndimage import median_filter
 
+from ..analytics.motion_smoothing import PositionSmoother
 from ..data_models import BallState, FrameState, PitchPosition
 
 logger = logging.getLogger(__name__)
@@ -33,15 +34,28 @@ class PitchTransformer:
         self._player_timestamps: dict[int, list[float]] = {}
         self._timestamps: list[float] = []
 
+        # EMA position smoother
+        acfg = config.get("analytics", {})
+        smoothing_alpha: float = acfg.get("smoothing_alpha", 0.35)
+        self._smoother = PositionSmoother(alpha=smoothing_alpha)
+
         # Glitch filter: max plausible displacement per frame
-        self._max_displacement_m: float = tf_cfg.get("max_displacement_m", 5.0)
-        self._speed_cap_mps: float = tf_cfg.get("speed_cap_mps", 15.0)
+        self._max_displacement_m: float = tf_cfg.get("max_displacement_m", 4.0)
+        self._speed_cap_mps: float = tf_cfg.get("speed_cap_mps", 12.0)
+        self._max_dt: float = 0.5  # skip segments with dt > this
+
+        # Camera-motion stabilization (cumulative pixel offset)
+        self._cumulative_dx: float = 0.0
+        self._cumulative_dy: float = 0.0
+        self._stabilize: bool = tf_cfg.get("stabilize_with_camera_motion", True)
 
         # Diagnostics (logged once at end)
         self._raw_speeds: list[float] = []
         self._displacements: list[float] = []
         self._dts: list[float] = []
         self._glitch_count: int = 0
+        self._max_speed_observed: float = 0.0  # pre-filter max
+        self._max_speed_kept: float = 0.0  # post-filter max
 
     def transform(self, frame_state: FrameState) -> FrameState:
         """Map all positions to pitch coordinates and compute speeds."""
@@ -50,24 +64,30 @@ class PitchTransformer:
         quality = frame_state.homography.quality
         self._timestamps.append(frame_state.timestamp_sec)
 
+        # Accumulate camera motion for pixel stabilization
+        self._update_cumulative_camera_motion(frame_state)
+
         # Players
         for player in frame_state.players:
             if available and H is not None:
                 px, py = player.detection.bbox.bottom_center
-                pitch_x, pitch_y = self._pixel_to_pitch(H, px, py)
-                if self._in_bounds(pitch_x, pitch_y):
+                px, py = self._stabilize_pixel(px, py)
+                raw_x, raw_y = self._pixel_to_pitch(H, px, py)
+                if self._in_bounds(raw_x, raw_y):
+                    # EMA-smooth the pitch position
+                    tid = player.track_id
+                    sm_x, sm_y = self._smoother.smooth(tid, raw_x, raw_y)
                     player.pitch_pos = PitchPosition(
-                        x=pitch_x, y=pitch_y, confidence=quality,
+                        x=sm_x, y=sm_y, confidence=quality,
                     )
                     # Track history for speed (per-player timestamps)
-                    tid = player.track_id
                     if tid not in self._player_history:
                         self._player_history[tid] = []
                         self._player_timestamps[tid] = []
                     player.speed_mps = self._compute_speed_safe(
                         self._player_history[tid],
                         self._player_timestamps[tid],
-                        (pitch_x, pitch_y),
+                        (sm_x, sm_y),
                         frame_state.timestamp_sec,
                     )
                 else:
@@ -78,6 +98,7 @@ class PitchTransformer:
         # Ball
         if frame_state.ball and frame_state.ball.detection and available and H is not None:
             bx, by = frame_state.ball.detection.bbox.center
+            bx, by = self._stabilize_pixel(bx, by)
             pitch_x, pitch_y = self._pixel_to_pitch(H, bx, by)
             if self._in_bounds(pitch_x, pitch_y):
                 frame_state.ball.pitch_pos = PitchPosition(
@@ -125,6 +146,23 @@ class PitchTransformer:
         margin = 5.0  # allow slight out-of-bounds
         return (-margin <= x <= self.pitch_length + margin and
                 -margin <= y <= self.pitch_width + margin)
+
+    def _update_cumulative_camera_motion(self, frame_state: FrameState) -> None:
+        """Accumulate smoothed camera-motion translation from the current frame."""
+        if not self._stabilize:
+            return
+        cam = frame_state.analytics.get("camera_motion")
+        if cam is None:
+            return
+        # Use smoothed per-frame delta (already EMA-filtered by CameraMotionEstimator)
+        self._cumulative_dx += cam.get("smoothed_dx_px", 0.0)
+        self._cumulative_dy += cam.get("smoothed_dy_px", 0.0)
+
+    def _stabilize_pixel(self, px: float, py: float) -> tuple[float, float]:
+        """Subtract cumulative camera translation from pixel coordinates."""
+        if not self._stabilize:
+            return (px, py)
+        return (px - self._cumulative_dx, py - self._cumulative_dy)
 
     def _interpolate_ball_gaps(self, frame_state: FrameState) -> None:
         """Fill short gaps in ball trajectory via linear interpolation."""
@@ -175,7 +213,7 @@ class PitchTransformer:
             dt = current_ts - ts_history[-1]
             self._dts.append(dt)
 
-            if dt > 0:
+            if dt > 0 and dt <= self._max_dt:
                 dx = current_pos[0] - prev[0]
                 dy = current_pos[1] - prev[1]
                 dist = (dx * dx + dy * dy) ** 0.5
@@ -187,7 +225,17 @@ class PitchTransformer:
                 else:
                     raw = dist / dt
                     self._raw_speeds.append(raw)
-                    speed = min(raw, self._speed_cap_mps)
+                    # Track pre-filter max
+                    if raw > self._max_speed_observed:
+                        self._max_speed_observed = raw
+                    if raw > self._speed_cap_mps:
+                        speed = self._speed_cap_mps
+                        self._glitch_count += 1
+                    else:
+                        speed = raw
+                    # Track post-filter max
+                    if speed is not None and speed > self._max_speed_kept:
+                        self._max_speed_kept = speed
 
         history.append(current_pos)
         ts_history.append(current_ts)
@@ -208,3 +256,18 @@ class PitchTransformer:
             avg_dt, avg_disp, top_raw, avg_raw,
             self._glitch_count, self._speed_cap_mps,
         )
+
+    def get_motion_diagnostics(self) -> dict[str, Any]:
+        """Return motion diagnostics dict for inclusion in run_report."""
+        avg_fps = 0.0
+        if self._dts:
+            valid_dts = [dt for dt in self._dts if 0 < dt <= self._max_dt]
+            if valid_dts:
+                avg_dt = sum(valid_dts) / len(valid_dts)
+                avg_fps = round(1.0 / avg_dt, 1) if avg_dt > 0 else 0.0
+        return {
+            "avg_fps_estimate": avg_fps,
+            "motion_glitch_count": self._glitch_count,
+            "max_speed_mps_observed": round(self._max_speed_observed, 2),
+            "max_speed_mps_kept": round(self._max_speed_kept, 2),
+        }

@@ -60,8 +60,8 @@ class PhysicalStats:
             if tid in self._prev_pos:
                 prev = self._prev_pos[tid]
                 d = ((pos[0] - prev[0]) ** 2 + (pos[1] - prev[1]) ** 2) ** 0.5
-                # Sanity: ignore teleports > 5m between frames (tracking glitch)
-                if d <= 5.0:
+                # Sanity: ignore teleports > 4m between frames (tracking glitch)
+                if d <= 4.0:
                     self._distance[tid] += d
             self._prev_pos[tid] = pos
 

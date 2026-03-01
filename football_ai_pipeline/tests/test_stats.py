@@ -66,25 +66,25 @@ def config():
 class TestPhysicalStats:
     def test_distance_accumulation(self, config):
         stats = PhysicalStats(config)
-        p1 = _make_player(1, 0, 50.0, 34.0, speed=5.0)
+        p1 = _make_player(1, 0, 50.0, 34.0, speed=3.0)
         f1 = _make_frame(0, 0.0, players=[p1])
         stats.update(f1)
 
-        p2 = _make_player(1, 0, 55.0, 34.0, speed=5.0)
+        p2 = _make_player(1, 0, 53.0, 34.0, speed=3.0)
         f2 = _make_frame(1, 1.0, players=[p2])
         stats.update(f2)
 
         summary = stats.get_player_summary()
         assert 1 in summary
-        assert summary[1]["distance_m"] == pytest.approx(5.0, abs=0.1)
+        assert summary[1]["distance_m"] == pytest.approx(3.0, abs=0.1)
 
     def test_sprint_detection(self, config):
         stats = PhysicalStats(config)
         # Not sprinting
         p1 = _make_player(1, 0, 50.0, 34.0, speed=3.0)
         stats.update(_make_frame(0, 0.0, players=[p1]))
-        # Sprinting
-        p2 = _make_player(1, 0, 55.0, 34.0, speed=8.0)
+        # Sprinting (3m displacement at 8 m/s — within 4m cap)
+        p2 = _make_player(1, 0, 53.0, 34.0, speed=8.0)
         stats.update(_make_frame(1, 1.0, players=[p2]))
 
         summary = stats.get_player_summary()

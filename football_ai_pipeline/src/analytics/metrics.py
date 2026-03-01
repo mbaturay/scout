@@ -325,8 +325,8 @@ class MetricsComputer:
     # ---- Player stats ----
 
     # Max single-frame displacement to accept (metres). Larger = tracking glitch.
-    _MAX_FRAME_DISPLACEMENT_M = 5.0
-    _SPEED_CAP_MPS = 15.0
+    _MAX_FRAME_DISPLACEMENT_M = 4.0
+    _SPEED_CAP_MPS = 12.0
 
     def _compute_player_stats(
         self,
@@ -336,10 +336,13 @@ class MetricsComputer:
     ) -> dict[int, dict[str, Any]]:
         dt = 1.0 / fps if fps > 0 else 0.0
 
+        # Skip all displacement computation if dt is invalid
+        dt_valid = 0 < dt <= 0.5
+
         # Accumulate per-player data
         player_team: dict[int, int] = {}
         player_distances: dict[int, float] = defaultdict(float)
-        player_active_frames: dict[int, int] = defaultdict(int)
+        player_valid_seconds: dict[int, float] = defaultdict(float)
         player_speeds: dict[int, list[float]] = defaultdict(list)
         player_positions: dict[int, list[tuple[float, float]]] = defaultdict(list)
         prev_pos: dict[int, tuple[float, float]] = {}
@@ -353,18 +356,18 @@ class MetricsComputer:
                 if pinfo.get("is_pitch", False):
                     pos = (pinfo["x"], pinfo["y"])
                     player_positions[pid].append(pos)
-                    player_active_frames[pid] += 1
 
-                    if pid in prev_pos:
+                    if pid in prev_pos and dt_valid:
                         dx = pos[0] - prev_pos[pid][0]
                         dy = pos[1] - prev_pos[pid][1]
                         seg_dist = math.sqrt(dx * dx + dy * dy)
                         if seg_dist <= self._MAX_FRAME_DISPLACEMENT_M:
-                            player_distances[pid] += seg_dist
-                            if dt > 0:
-                                player_speeds[pid].append(
-                                    min(seg_dist / dt, self._SPEED_CAP_MPS)
-                                )
+                            speed = seg_dist / dt
+                            if speed <= self._SPEED_CAP_MPS:
+                                player_distances[pid] += seg_dist
+                                player_valid_seconds[pid] += dt
+                                player_speeds[pid].append(speed)
+                            # else: speed glitch, skip segment
                         # else: tracking glitch, skip segment
                     prev_pos[pid] = pos
 
@@ -380,7 +383,7 @@ class MetricsComputer:
             positions = player_positions.get(pid, [])
             is_pitch = len(positions) > 0
             dist = player_distances.get(pid, 0.0)
-            active_sec = player_active_frames.get(pid, 0) * dt
+            active_sec = player_valid_seconds.get(pid, 0.0)
 
             heatmap = None
             if positions:

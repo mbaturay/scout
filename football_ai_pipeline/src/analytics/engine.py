@@ -145,12 +145,19 @@ class AnalyticsEngine:
             self._fps,
         )
 
-        # Compute v1 possession (tight 1.25 m threshold)
+        # Compute v2 possession (ball state + hysteresis)
         acfg = self.config.get("analytics", {})
         max_dist = acfg.get("possession_max_dist_m", 1.25)
         write_timeline = acfg.get("possession_write_timeline", False)
+        min_ctrl = acfg.get("possession_min_control_frames", 5)
+        max_gap = acfg.get("possession_max_gap_frames", 10)
+        air_thresh = acfg.get("air_speed_threshold", 15.0)
         poss_result = compute_possession(
-            self._serialized_frames, max_dist_m=max_dist,
+            self._serialized_frames,
+            max_dist_m=max_dist,
+            min_control_frames=min_ctrl,
+            max_gap_frames=max_gap,
+            air_speed_threshold=air_thresh,
         )
         logger.info(
             "Possession computed: %d owned / %d total frames",
@@ -175,23 +182,31 @@ class AnalyticsEngine:
                     "touches": touches,
                 }
 
-        # --- V1 pass detection ---
-        # Extract ball positions aligned with the possession timeline
+        # --- V2 pass detection ---
+        # Extract ball positions and timestamps aligned with the possession timeline
         ball_positions_for_passes: list[Optional[tuple[float, float]]] = []
+        frame_timestamps: list[float] = []
         for frame in self._serialized_frames:
             ball_xy, _ = extract_tracks_from_frame(frame)
             ball_positions_for_passes.append(ball_xy)
+            frame_timestamps.append(frame.get("timestamp_sec", 0.0))
 
-        pass_min_dist = acfg.get("pass_min_dist_m", 3.0)
+        pass_min_dist = acfg.get("pass_min_dist_m", 4.0)
         pass_max_gap = acfg.get("pass_max_gap_frames", 10)
+        pass_max_time = acfg.get("pass_max_time_s", 1.5)
+        pass_air_gap = acfg.get("pass_air_gap_frames", 20)
         pass_events = compute_passes(
             poss_result.timeline,
             ball_positions_for_passes,
             poss_result.player_team,
+            fps=self._fps,
+            timestamps=frame_timestamps,
             min_pass_dist_m=pass_min_dist,
             max_gap_frames=pass_max_gap,
+            max_pass_time_s=pass_max_time,
+            air_gap_frames=pass_air_gap,
         )
-        logger.info("Detected %d pass events (v1)", len(pass_events))
+        logger.info("Detected %d pass events (v2)", len(pass_events))
 
         # Aggregate pass stats and merge into team/player stats
         team_pass_stats, player_pass_stats = aggregate_pass_stats(
@@ -202,6 +217,7 @@ class AnalyticsEngine:
                 result["team_stats"][tid]["pass_count"] = pstats["pass_count"]
                 result["team_stats"][tid]["pass_completed"] = pstats["completed_pass_count"]
                 result["team_stats"][tid]["pass_completion_pct"] = pstats["pass_accuracy_pct"]
+                result["team_stats"][tid]["interceptions_won"] = pstats.get("interceptions_won", 0)
             else:
                 result["team_stats"][tid] = pstats
 
@@ -211,6 +227,7 @@ class AnalyticsEngine:
                 result["player_stats"][pid]["passes_completed"] = pstats["passes_completed"]
                 result["player_stats"][pid]["pass_accuracy_pct"] = pstats["pass_accuracy_pct"]
                 result["player_stats"][pid]["passes"] = pstats["passes_attempted"]
+                result["player_stats"][pid]["interceptions"] = pstats.get("interceptions", 0)
             else:
                 team_id = poss_result.player_team.get(pid)
                 result["player_stats"][pid] = {
@@ -219,21 +236,22 @@ class AnalyticsEngine:
                     "passes": pstats["passes_attempted"],
                 }
 
-        # Append pass/interception events to the main event list
+        # Append pass/interception/turnover events to the main event list
         for pe in pass_events:
             ev = MatchEvent(
-                event_type="pass" if pe.is_completed else "interception",
+                event_type=pe.reason,  # "pass" | "interception" | "turnover"
                 frame_idx=pe.t_start,
                 timestamp_sec=pe.t_start / self._fps,
-                team_id=pe.team_id,
-                player_id=pe.from_track,
+                team_id=pe.team_id if pe.reason != "interception" else pe.to_team_id,
+                player_id=pe.from_track if pe.reason != "interception" else pe.to_track,
                 target_player_id=pe.to_track,
                 target_team_id=pe.to_team_id,
                 confidence=0.6,
                 features={
                     "dist_m": round(pe.dist_m, 2),
-                    "reason": pe.reason,
-                    "source": "v1_pass_detection",
+                    "duration_s": round(pe.duration_s, 3),
+                    "type": pe.reason,
+                    "source": "v2_pass_detection",
                 },
             )
             events.append(ev)
@@ -269,6 +287,10 @@ class AnalyticsEngine:
             "possession_computed": True,
             "possession_owned_frames": poss_result.owned_frames,
             "possession_total_frames": poss_result.total_frames,
+            "possession_controlled_frames": poss_result.controlled_frames,
+            "possession_loose_frames": poss_result.loose_frames,
+            "possession_air_frames": poss_result.air_frames,
+            "possession_ball_detected_frames": poss_result.ball_detected_frames,
             "pass_events_detected": len(pass_events),
             "pass_events_completed": sum(1 for p in pass_events if p.is_completed),
         }

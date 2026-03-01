@@ -1,13 +1,17 @@
-"""V1 possession: ball-to-nearest-player ownership and team possession stats.
+"""V2 possession: ball-state classification, hysteresis, and team possession stats.
 
 Provides standalone possession computation that can run:
 1. Inline during the analytics pipeline (via AnalyticsEngine)
 2. Post-hoc from frames.jsonl for inspection/debugging
 
 Key design decisions:
-  - max_dist_m = 1.25 (tight threshold for v1)
-  - Touch increments when owner_track_id changes between non-None owners
-  - Unowned / missing-ball frames counted separately (not attributed to any team)
+  - max_dist_m = 1.25 (tight threshold for controlled state)
+  - Ball states: controlled (player within threshold), loose (no player near),
+    air (ball speed above threshold or height proxy)
+  - Hysteresis: min_control_frames=5 to confirm new owner,
+    max_gap_frames=10 to retain owner through short gaps
+  - Touch increments when confirmed owner changes
+  - Team possession % computed from controlled frames only
   - Player→team lookup built from most-frequent assignment across all frames
 """
 
@@ -37,6 +41,7 @@ class FrameBallOwner:
     owner_team_id: Optional[int] = None
     distance_m: Optional[float] = None
     ball_available: bool = False
+    ball_state: str = "unknown"  # "controlled" | "loose" | "air" | "unknown"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +50,7 @@ class FrameBallOwner:
             "owner_team_id": self.owner_team_id,
             "distance_m": round(self.distance_m, 3) if self.distance_m is not None else None,
             "ball_available": self.ball_available,
+            "ball_state": self.ball_state,
         }
 
 
@@ -60,6 +66,10 @@ class PossessionResult:
     owned_frames: int = 0
     unowned_frames: int = 0
     ball_missing_frames: int = 0
+    controlled_frames: int = 0
+    loose_frames: int = 0
+    air_frames: int = 0
+    ball_detected_frames: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +111,16 @@ def extract_tracks_from_frame(frame: dict[str, Any]) -> tuple[
         })
 
     return ball_xy, players
+
+
+def extract_ball_speed_from_frame(frame: dict[str, Any]) -> Optional[float]:
+    """Extract ball speed (m/s) from a serialised frame dict."""
+    ball = frame.get("ball")
+    if ball is not None:
+        spd = ball.get("speed_mps")
+        if spd is not None:
+            return float(spd)
+    return None
 
 
 def assign_ball_owner(
@@ -169,18 +189,56 @@ def build_player_team_lookup(
 # Core possession computation
 # ---------------------------------------------------------------------------
 
+def classify_ball_state(
+    ball_xy: Optional[tuple[float, float]],
+    players: list[dict[str, Any]],
+    ball_speed_mps: Optional[float],
+    max_dist_m: float,
+    air_speed_threshold: float = 15.0,
+) -> str:
+    """Classify the ball state for this frame.
+
+    Returns one of: "controlled", "loose", "air", "unknown".
+    """
+    if ball_xy is None:
+        return "unknown"
+
+    # Air: ball moving fast (likely a long pass/shot in flight)
+    if ball_speed_mps is not None and ball_speed_mps > air_speed_threshold:
+        return "air"
+
+    # Check if any player is within control range
+    _, _, dist = assign_ball_owner(ball_xy, players, max_dist_m)
+    if dist is not None:
+        return "controlled"
+
+    return "loose"
+
+
 def compute_possession(
     frames: list[dict[str, Any]],
     max_dist_m: float = 1.25,
     player_team_override: Optional[dict[int, int]] = None,
+    min_control_frames: int = 5,
+    max_gap_frames: int = 10,
+    air_speed_threshold: float = 15.0,
 ) -> PossessionResult:
     """Compute team/player possession from a list of serialised frame dicts.
+
+    Uses ball state classification (controlled/loose/air) and hysteresis
+    to prevent flickering in ownership assignment.
 
     Args:
         frames:                List of frame dicts (from frames.jsonl or FrameState.to_serializable()).
         max_dist_m:            Maximum ball-to-player distance for ownership.
         player_team_override:  Optional pre-built track_id→team_id map.
                                If None, built automatically from frames.
+        min_control_frames:    Consecutive frames a candidate must be nearest
+                               before ownership switches (hysteresis).
+        max_gap_frames:        Maximum consecutive non-controlled frames to
+                               retain the current owner through.
+        air_speed_threshold:   Ball speed (m/s) above which the ball is
+                               classified as "air".
 
     Returns:
         PossessionResult with team possession %, player touches, and timeline.
@@ -193,9 +251,20 @@ def compute_possession(
     timeline: list[FrameBallOwner] = []
     team_frames: dict[int, int] = defaultdict(int)
     player_touches: dict[int, int] = defaultdict(int)
-    prev_owner: Optional[int] = None
+
+    # Hysteresis state
+    confirmed_owner: Optional[int] = None   # currently confirmed owner
+    confirmed_team: Optional[int] = None
+    candidate_owner: Optional[int] = None   # candidate waiting to be confirmed
+    candidate_count: int = 0                # consecutive frames candidate has been nearest
+    gap_count: int = 0                      # frames since confirmed owner lost control
+
     owned_frames = 0
     ball_missing = 0
+    controlled_frames = 0
+    loose_frames = 0
+    air_frames = 0
+    ball_detected = 0
 
     for frame in frames:
         fidx = frame.get("frame_idx", len(timeline))
@@ -203,49 +272,124 @@ def compute_possession(
         # Skip not-in-play frames
         if frame.get("flag") == "not_in_play":
             timeline.append(FrameBallOwner(frame_idx=fidx))
-            prev_owner = None
+            confirmed_owner = None
+            confirmed_team = None
+            candidate_owner = None
+            candidate_count = 0
+            gap_count = 0
             continue
 
         ball_xy, players = extract_tracks_from_frame(frame)
+        ball_speed = extract_ball_speed_from_frame(frame)
 
         rec = FrameBallOwner(frame_idx=fidx)
 
         if ball_xy is None:
             ball_missing += 1
             rec.ball_available = False
+            rec.ball_state = "unknown"
+            # Count gap for hysteresis
+            gap_count += 1
+            if gap_count > max_gap_frames:
+                confirmed_owner = None
+                confirmed_team = None
+                candidate_owner = None
+                candidate_count = 0
             timeline.append(rec)
-            prev_owner = None
             continue
 
+        ball_detected += 1
         rec.ball_available = True
+
+        # Classify ball state
+        state = classify_ball_state(
+            ball_xy, players, ball_speed, max_dist_m, air_speed_threshold,
+        )
+        rec.ball_state = state
+
+        if state == "controlled":
+            controlled_frames += 1
+        elif state == "loose":
+            loose_frames += 1
+        elif state == "air":
+            air_frames += 1
+
+        # Find nearest player candidate
         track_id, frame_team, dist = assign_ball_owner(ball_xy, players, max_dist_m)
 
-        if track_id is not None:
-            # Resolve team_id: prefer the lookup (most-frequent), fall back to frame
+        if state == "controlled" and track_id is not None:
             team_id = pt_lookup.get(track_id, frame_team)
-
-            rec.owner_track_id = track_id
-            rec.owner_team_id = team_id
             rec.distance_m = dist
-            owned_frames += 1
 
-            if team_id is not None:
-                team_frames[team_id] += 1
+            if track_id == confirmed_owner:
+                # Same owner — reset gap, keep going
+                gap_count = 0
+                candidate_owner = None
+                candidate_count = 0
+            elif track_id == candidate_owner:
+                # Same candidate — increment count
+                candidate_count += 1
+            else:
+                # New candidate — start counting
+                candidate_owner = track_id
+                candidate_count = 1
 
-            # Touch segmentation: new touch when owner changes
-            if track_id != prev_owner and prev_owner is not None:
-                player_touches[track_id] += 1
-            elif prev_owner is None and track_id is not None:
-                # First touch after gap or start
-                player_touches[track_id] += 1
+            # Check if candidate has earned ownership
+            if candidate_owner is not None and candidate_count >= min_control_frames:
+                # Ownership switch
+                old_owner = confirmed_owner
+                confirmed_owner = candidate_owner
+                confirmed_team = pt_lookup.get(confirmed_owner, frame_team)
+                candidate_owner = None
+                candidate_count = 0
+                gap_count = 0
 
-            prev_owner = track_id
-        else:
-            prev_owner = None
+                # Record touch on ownership change
+                if confirmed_owner is not None:
+                    if old_owner is not None and old_owner != confirmed_owner:
+                        player_touches[confirmed_owner] += 1
+                    elif old_owner is None:
+                        player_touches[confirmed_owner] += 1
+
+            # If no confirmed owner yet and we have a candidate under threshold,
+            # accept immediately on first ever assignment
+            if confirmed_owner is None and track_id is not None:
+                confirmed_owner = track_id
+                confirmed_team = team_id
+                candidate_owner = None
+                candidate_count = 0
+                gap_count = 0
+                player_touches[confirmed_owner] += 1
+
+            # Assign confirmed owner to this frame
+            if confirmed_owner is not None:
+                rec.owner_track_id = confirmed_owner
+                rec.owner_team_id = confirmed_team
+                owned_frames += 1
+                if confirmed_team is not None:
+                    team_frames[confirmed_team] += 1
+                gap_count = 0
+
+        elif state in ("loose", "air"):
+            # No player in control range — count as gap
+            gap_count += 1
+            if gap_count <= max_gap_frames and confirmed_owner is not None:
+                # Retain owner through short gap
+                rec.owner_track_id = confirmed_owner
+                rec.owner_team_id = confirmed_team
+                owned_frames += 1
+                if confirmed_team is not None:
+                    team_frames[confirmed_team] += 1
+            else:
+                # Gap too long — drop ownership
+                confirmed_owner = None
+                confirmed_team = None
+                candidate_owner = None
+                candidate_count = 0
 
         timeline.append(rec)
 
-    # Compute team possession percentages
+    # Compute team possession percentages (from controlled+retained frames)
     total = len(timeline)
     team_possession: dict[int, float] = {}
     if owned_frames > 0:
@@ -261,6 +405,10 @@ def compute_possession(
         owned_frames=owned_frames,
         unowned_frames=total - owned_frames - ball_missing,
         ball_missing_frames=ball_missing,
+        controlled_frames=controlled_frames,
+        loose_frames=loose_frames,
+        air_frames=air_frames,
+        ball_detected_frames=ball_detected,
     )
 
 
@@ -269,19 +417,29 @@ def compute_possession(
 # ---------------------------------------------------------------------------
 
 def write_team_possession(path: Path, result: PossessionResult) -> None:
-    """Write out/team_possession.json."""
+    """Write out/team_possession.json with controlled/loose/air breakdown."""
     teams = []
     for tid in sorted(result.team_possession):
         teams.append({
             "team_id": tid,
             "possession_pct": result.team_possession[tid],
         })
+
+    # Ball state breakdown percentages (relative to ball_detected_frames)
+    det = max(result.ball_detected_frames, 1)
     data = {
         "teams": teams,
         "total_frames": result.total_frames,
+        "ball_detected_frames": result.ball_detected_frames,
         "owned_frames": result.owned_frames,
         "unowned_frames": result.unowned_frames,
         "ball_missing_frames": result.ball_missing_frames,
+        "controlled_frames": result.controlled_frames,
+        "loose_frames": result.loose_frames,
+        "air_frames": result.air_frames,
+        "controlled_pct": round(result.controlled_frames / det * 100.0, 1),
+        "loose_pct": round(result.loose_frames / det * 100.0, 1),
+        "air_pct": round(result.air_frames / det * 100.0, 1),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -309,7 +467,7 @@ def write_player_touches(path: Path, result: PossessionResult) -> None:
 def write_ball_owner_timeline(path: Path, result: PossessionResult) -> None:
     """Write out/ball_owner_timeline.csv (optional, for debugging)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["frame_idx", "owner_track_id", "owner_team_id", "distance_m", "ball_available"]
+    fieldnames = ["frame_idx", "owner_track_id", "owner_team_id", "distance_m", "ball_available", "ball_state"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

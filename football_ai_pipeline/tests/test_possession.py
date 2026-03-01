@@ -179,7 +179,10 @@ class TestComputePossession:
         assert result.owned_frames == 10
 
     def test_two_teams_split(self):
-        """First 5 frames team 0 owns, next 5 frames team 1 owns → ~50/50."""
+        """First 5 frames team 0 owns, next 5 frames team 1 owns → ~50/50.
+
+        Uses min_control_frames=1 to disable hysteresis for this test.
+        """
         frames = []
         for i in range(5):
             frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
@@ -191,7 +194,7 @@ class TestComputePossession:
                 {"track_id": 1, "team_id": 0, "x": 50.0, "y": 34.0},
                 {"track_id": 2, "team_id": 1, "x": 80.5, "y": 34.0},
             ]))
-        result = compute_possession(frames, max_dist_m=1.25)
+        result = compute_possession(frames, max_dist_m=1.25, min_control_frames=1)
         assert result.team_possession[0] == 50.0
         assert result.team_possession[1] == 50.0
 
@@ -221,7 +224,7 @@ class TestComputePossession:
         assert result.owned_frames == 1
 
     def test_touch_segmentation(self):
-        """Touch increments when owner changes."""
+        """Touch increments when owner changes (min_control_frames=1 for instant switch)."""
         frames = [
             _make_frame(0, ball_xy=(50.0, 34.0), players=[
                 {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
@@ -237,7 +240,7 @@ class TestComputePossession:
                 {"track_id": 2, "team_id": 0, "x": 80.5, "y": 34.0},
             ]),
         ]
-        result = compute_possession(frames, max_dist_m=1.25)
+        result = compute_possession(frames, max_dist_m=1.25, min_control_frames=1)
         # Player 1: first touch at frame 0
         # Player 2: touch at frame 2 (owner changed from 1→2)
         assert result.player_touches[1] == 1
@@ -273,6 +276,85 @@ class TestComputePossession:
         assert result.owned_frames == 0
         assert result.team_possession == {}
 
+    def test_hysteresis_prevents_flickering(self):
+        """With min_control_frames=3, a single-frame interloper doesn't steal ownership."""
+        frames = []
+        # 5 frames: player 1 owns
+        for i in range(5):
+            frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
+                {"track_id": 2, "team_id": 1, "x": 80.0, "y": 34.0},
+            ]))
+        # 1 frame: player 2 briefly nearest
+        frames.append(_make_frame(5, ball_xy=(50.0, 34.0), players=[
+            {"track_id": 1, "team_id": 0, "x": 52.0, "y": 34.0},
+            {"track_id": 2, "team_id": 1, "x": 50.3, "y": 34.0},
+        ]))
+        # 4 more frames: player 1 back
+        for i in range(6, 10):
+            frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
+                {"track_id": 2, "team_id": 1, "x": 80.0, "y": 34.0},
+            ]))
+        result = compute_possession(frames, max_dist_m=1.25, min_control_frames=3)
+        # Player 1 should keep ownership throughout — player 2's single frame is ignored
+        assert result.team_possession.get(0, 0) == 100.0
+        assert result.team_possession.get(1, 0) == 0.0 or 1 not in result.team_possession
+
+    def test_ball_state_classification(self):
+        """Ball state correctly classified as controlled, loose, or air."""
+        frames = [
+            # Controlled: player within 1.25m
+            _make_frame(0, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
+            ]),
+            # Loose: no player near
+            _make_frame(1, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 80.0, "y": 34.0},
+            ]),
+        ]
+        result = compute_possession(frames, max_dist_m=1.25, min_control_frames=1)
+        assert result.controlled_frames == 1
+        assert result.loose_frames == 1
+        assert result.ball_detected_frames == 2
+        assert result.timeline[0].ball_state == "controlled"
+        assert result.timeline[1].ball_state == "loose"
+
+    def test_air_state_from_ball_speed(self):
+        """Ball with high speed is classified as 'air'."""
+        frame = _make_frame(0, ball_xy=(50.0, 34.0), players=[
+            {"track_id": 1, "team_id": 0, "x": 80.0, "y": 34.0},
+        ])
+        frame["ball"]["speed_mps"] = 20.0  # above air threshold
+        result = compute_possession([frame], max_dist_m=1.25, air_speed_threshold=15.0)
+        assert result.air_frames == 1
+        assert result.timeline[0].ball_state == "air"
+
+    def test_gap_retention_keeps_owner(self):
+        """Owner is retained through short loose-ball gaps (max_gap_frames)."""
+        frames = []
+        # 3 frames: player 1 owns
+        for i in range(3):
+            frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
+            ]))
+        # 3 frames: ball loose (no player near)
+        for i in range(3, 6):
+            frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 80.0, "y": 34.0},
+            ]))
+        # 3 more frames: player 1 back
+        for i in range(6, 9):
+            frames.append(_make_frame(i, ball_xy=(50.0, 34.0), players=[
+                {"track_id": 1, "team_id": 0, "x": 50.5, "y": 34.0},
+            ]))
+        result = compute_possession(
+            frames, max_dist_m=1.25, min_control_frames=1, max_gap_frames=5,
+        )
+        # Owner retained through 3-frame gap (< max_gap_frames=5)
+        assert result.owned_frames == 9
+        assert result.team_possession[0] == 100.0
+
 
 # =========================================================================
 # Output writers
@@ -289,6 +371,10 @@ class TestPossessionWriters:
             owned_frames=80,
             unowned_frames=10,
             ball_missing_frames=10,
+            controlled_frames=60,
+            loose_frames=15,
+            air_frames=5,
+            ball_detected_frames=80,
         )
         path = tmp_path / "team_possession.json"
         write_team_possession(path, result)
@@ -298,6 +384,12 @@ class TestPossessionWriters:
         assert data["teams"][0]["team_id"] == 0
         assert data["teams"][0]["possession_pct"] == 60.0
         assert data["total_frames"] == 100
+        # V2: ball state breakdown
+        assert data["controlled_frames"] == 60
+        assert data["loose_frames"] == 15
+        assert data["air_frames"] == 5
+        assert data["ball_detected_frames"] == 80
+        assert data["controlled_pct"] == 75.0  # 60/80*100
 
     def test_write_player_touches(self, tmp_path):
         result = PossessionResult(

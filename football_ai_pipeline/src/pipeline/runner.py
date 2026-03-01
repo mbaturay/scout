@@ -22,6 +22,7 @@ from ..stats import StatsAggregator
 from ..visualization import FrameAnnotator
 from ..exports import Exporter
 from ..analytics.engine import AnalyticsEngine
+from ..vision import CameraMotionEstimator
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class PipelineRunner:
         self.annotator = FrameAnnotator(config)
         self.exporter = Exporter(self.output_dir, config)
         self.analytics_engine = AnalyticsEngine(config)
+        self.camera_motion = CameraMotionEstimator(config)
 
         viz_cfg = config.get("visualization", {})
         self._write_video = viz_cfg.get("enabled", True)
@@ -108,6 +110,7 @@ class PipelineRunner:
         lines.append("  [OK]  Homography    : DLT/RANSAC with temporal smoothing")
         lines.append("  [OK]  Stats (A-E)   : All analytics modules active")
         lines.append("  [OK]  Analytics     : Possession, events, xG, heatmaps")
+        lines.append("  [OK]  Camera motion : ORB feature matching + affine RANSAC")
         lines.append("  [OK]  Exports       : JSONL + CSV + JSON")
 
         if self._write_video:
@@ -178,7 +181,10 @@ class PipelineRunner:
             desc="Processing frames",
             total=estimated_total,
         ):
-            frame_state = self._process_frame(frame_idx, timestamp, image)
+            # Camera motion estimation (runs on raw BGR frame)
+            cam_rec = self.camera_motion.update(frame_idx, timestamp, image)
+
+            frame_state = self._process_frame(frame_idx, timestamp, image, cam_rec)
             self._update_counters(frame_state)
 
             # Export frame data
@@ -197,7 +203,11 @@ class PipelineRunner:
         self._finalize(start_time)
 
     def _process_frame(
-        self, frame_idx: int, timestamp: float, image: Any,
+        self,
+        frame_idx: int,
+        timestamp: float,
+        image: Any,
+        camera_motion: dict[str, Any] | None = None,
     ) -> FrameState:
         """Run all pipeline stages on one frame."""
         fs = FrameState(
@@ -205,6 +215,10 @@ class PipelineRunner:
             timestamp_sec=timestamp,
             image=image,
         )
+
+        # Attach camera motion early so PitchTransformer can use it
+        if camera_motion is not None:
+            fs.analytics["camera_motion"] = camera_motion
 
         # FR2 — In-play filter
         fs = self.in_play_filter.classify(fs)
@@ -320,6 +334,7 @@ class PipelineRunner:
 
         # Log motion physics diagnostics
         self.pitch_transformer.log_diagnostics()
+        motion_diagnostics = self.pitch_transformer.get_motion_diagnostics()
 
         # Get aggregated stats
         full_report = self.stats_aggregator.get_full_report()
@@ -352,6 +367,13 @@ class PipelineRunner:
         # Run analytics finalization (events, metrics, heatmaps)
         analytics_summary = self.analytics_engine.finalize(self.output_dir)
         coverage["analytics"] = analytics_summary
+
+        # Add motion physics diagnostics
+        coverage["motion"] = motion_diagnostics
+
+        # Write camera motion JSONL and add summary
+        self.camera_motion.write_jsonl(self.output_dir)
+        coverage["camera_motion"] = self.camera_motion.get_summary()
 
         # Build degradation report
         degradation = self._build_degradation_report()
